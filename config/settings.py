@@ -12,7 +12,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DATABASE_PATH = os.path.join(DATA_DIR, 'retailpos.db')
 
 APP_NAME    = "RetailPOSPro"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 # BackOfficePro API default — overridden by settings table at runtime
 DEFAULT_API_URL = "http://localhost:5050"

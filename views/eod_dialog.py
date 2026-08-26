@@ -70,8 +70,9 @@ class _SettleThread(QThread):
 # ── EOD Dialog ────────────────────────────────────────────────────────────────
 
 class EODDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, operator_id: int | None = None):
         super().__init__(parent)
+        self._operator_id = operator_id
         self.setWindowTitle("End of Day")
         self.setModal(True)
         self.setStyleSheet(_BASE_STYLE)
@@ -107,9 +108,16 @@ class EODDialog(QDialog):
             """, (self._today,)).fetchone()
             self._totals = dict(row)
 
-            shift_row = conn.execute(
-                "SELECT * FROM shifts WHERE status='OPEN' ORDER BY opened_at DESC LIMIT 1"
-            ).fetchone()
+            if self._operator_id is not None:
+                shift_row = conn.execute(
+                    "SELECT * FROM shifts WHERE status='OPEN' AND operator_id=? "
+                    "ORDER BY opened_at DESC LIMIT 1",
+                    (self._operator_id,)
+                ).fetchone()
+            else:
+                shift_row = conn.execute(
+                    "SELECT * FROM shifts WHERE status='OPEN' ORDER BY opened_at DESC LIMIT 1"
+                ).fetchone()
             self._shift = dict(shift_row) if shift_row else None
 
             store_row = conn.execute(
@@ -424,9 +432,8 @@ class EODDialog(QDialog):
     def _confirm_manual_settle(self):
         from hardware.eftpos import EFTPOSResult
         self._settle_result = EFTPOSResult(
-            EFTPOSResult.APPROVED, message="Manually confirmed by operator"
+            'manual_required', message="Manually confirmed by operator"
         )
-        self._settle_result.status = 'manual_required'
         self._settle_status_lbl.setText("✓ Settlement confirmed by operator")
         self._settle_status_lbl.setStyleSheet("font-size: 14px; color: #4CAF50;")
 

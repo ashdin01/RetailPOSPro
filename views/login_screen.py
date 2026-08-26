@@ -2,7 +2,7 @@
 PIN-based login screen — touch friendly.
 Shows operator buttons (large, tappable) + a PIN entry pad.
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QDialog, QFormLayout, QLineEdit, QMessageBox
@@ -14,9 +14,6 @@ from config.settings import APP_NAME, TOUCH_BTN_HEIGHT
 
 _MAX_ATTEMPTS   = 5
 _LOCKOUT_SECS   = 30
-
-_failed:  dict = {}
-_lockout: dict = {}
 
 
 class _SetupPinDialog(QDialog):
@@ -218,7 +215,7 @@ class LoginScreen(QWidget):
         self._countdown_timer.stop()
         self._countdown_user = None
         username = op['username']
-        until = _lockout.get(username)
+        until = op_model.get_lockout_until(username)
         if until and datetime.now() < until:
             self._start_countdown(username)
         else:
@@ -232,7 +229,7 @@ class LoginScreen(QWidget):
             self.status_lbl.setText("Please select your name first.")
             return
         username = self._selected['username']
-        until = _lockout.get(username)
+        until = op_model.get_lockout_until(username)
         if until and datetime.now() < until:
             self._start_countdown(username)
             return
@@ -241,16 +238,14 @@ class LoginScreen(QWidget):
             self.status_lbl.setText("Please enter your PIN.")
             return
         if op_model.verify_pin(username, pin):
-            _failed.pop(username, None)
-            _lockout.pop(username, None)
+            op_model.clear_lockout(username)
             self._on_login(self._selected)
         else:
-            attempts = _failed.get(username, 0) + 1
-            _failed[username] = attempts
+            attempts, until = op_model.record_failed_attempt(
+                username, _MAX_ATTEMPTS, _LOCKOUT_SECS
+            )
             self.pin_input.clear()
-            if attempts >= _MAX_ATTEMPTS:
-                _failed[username] = 0
-                _lockout[username] = datetime.now() + timedelta(seconds=_LOCKOUT_SECS)
+            if until is not None:
                 self._start_countdown(username)
             else:
                 remaining = _MAX_ATTEMPTS - attempts
@@ -268,7 +263,7 @@ class LoginScreen(QWidget):
         username = self._countdown_user
         if not username:
             return
-        until = _lockout.get(username)
+        until = op_model.get_lockout_until(username)
         if not until:
             self._unlock()
             return

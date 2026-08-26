@@ -45,7 +45,9 @@ def _ensure_api_running():
         conn.close()
 
     try:
-        r = requests.get(f"{api_url}/api/v1/health", timeout=2)
+        import api.backoffice_client as _bop
+        r = requests.get(f"{api_url}/api/v1/health", timeout=2,
+                         verify=_bop._ssl_verify())
         if r.status_code == 200 and r.json().get('status') == 'ok':
             logging.info("[API] BackOfficePro API already running at %s", api_url)
             return
@@ -103,6 +105,57 @@ def _run():
     app.setPalette(palette)
 
     _windows = {}
+    _customer_display = {'window': None}
+
+    def _read_customer_display_settings():
+        conn = get_connection()
+        try:
+            rows = {
+                r['key']: r['value'] for r in conn.execute(
+                    "SELECT key, value FROM settings WHERE key IN "
+                    "('customer_display_ads_dir', 'customer_display_idle_secs')"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        ads_dir = rows.get('customer_display_ads_dir') or ''
+        try:
+            idle_secs = int(rows.get('customer_display_idle_secs') or 20)
+        except ValueError:
+            idle_secs = 20
+        return ads_dir, idle_secs
+
+    def _secondary_screen():
+        primary = app.primaryScreen()
+        others = [s for s in app.screens() if s is not primary]
+        return others[0] if others else None
+
+    def _sync_customer_display():
+        """Open/close the customer-facing display as a second monitor is
+        plugged in or unplugged, so no restart is needed to activate it."""
+        screen = _secondary_screen()
+        win = _customer_display['window']
+        if screen is None:
+            if win is not None:
+                win.close()
+                _customer_display['window'] = None
+            return
+        if win is None:
+            from views.customer_display import CustomerDisplay
+            ads_dir, idle_secs = _read_customer_display_settings()
+            win = CustomerDisplay(ads_dir=ads_dir, idle_secs=idle_secs)
+            _customer_display['window'] = win
+        win.setGeometry(screen.geometry())
+        win.showFullScreen()
+
+    def _push_to_customer_display(items, subtotal, gst, total):
+        win = _customer_display['window']
+        if win is not None:
+            win.show_basket(items, subtotal, gst, total)
+
+    app.screenAdded.connect(lambda _: _sync_customer_display())
+    app.screenRemoved.connect(lambda _: _sync_customer_display())
+    _sync_customer_display()
 
     def _on_login(operator: dict):
         from views.login_screen import LoginScreen
@@ -123,7 +176,7 @@ def _run():
                     float_open_variance=float_dlg.float_variance,
                 )
         except Exception as e:
-            logging.warning(f"Shift management error: {e}")
+            logging.warning("Shift management error: %s", e)
 
         from views.pos_screen import POSScreen
         pos = POSScreen(operator=operator, shift_id=shift_id)
@@ -135,6 +188,7 @@ def _run():
             _windows['login'] = login
 
         pos.lock_requested.connect(_on_lock)
+        pos.basket_changed.connect(_push_to_customer_display)
         pos.show()
         _windows['pos'] = pos
 

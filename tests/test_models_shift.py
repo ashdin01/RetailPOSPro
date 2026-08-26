@@ -1,3 +1,4 @@
+import pytest
 import models.shift as shift
 from database.connection import get_connection
 
@@ -78,6 +79,16 @@ class TestCloseShift:
         assert "transaction_count" in result
         assert "cash_sales" in result
         assert "eftpos_sales" in result
+
+    def test_close_nonexistent_shift_raises(self, test_db):
+        with pytest.raises(ValueError, match="not found or already closed"):
+            shift.close_shift(9999)
+
+    def test_close_already_closed_shift_raises(self, test_db, operator_id):
+        sid = shift.open_shift(operator_id, "Test Op")
+        shift.close_shift(sid)
+        with pytest.raises(ValueError, match="not found or already closed"):
+            shift.close_shift(sid)  # second close must fail
 
     def test_totals_reflect_transactions(self, test_db, operator_id):
         import models.transaction as txn

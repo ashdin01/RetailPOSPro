@@ -1,32 +1,22 @@
 from datetime import date
 from database.connection import get_connection
-from database.connection import get_connection
 
 
-def _next_reference(terminal_id: str) -> str:
-    conn = get_connection()
-    try:
-        today = date.today().strftime('%Y%m%d')
-        prefix = f"{terminal_id}-{today}-"
-        row = conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE reference LIKE ?",
-            (f"{prefix}%",)
-        ).fetchone()
-        seq = (row[0] or 0) + 1
-        return f"{prefix}{seq:04d}"
-    finally:
-        conn.close()
+def _generate_reference(conn, terminal_id: str) -> str:
+    """Return the next sequential reference for today using the given connection.
 
-
-def _get_terminal_id() -> str:
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT value FROM settings WHERE key='terminal_id'"
-        ).fetchone()
-        return (row['value'] or 'POS-001') if row else 'POS-001'
-    finally:
-        conn.close()
+    Uses MAX over the numeric suffix rather than COUNT so that deleting a
+    past transaction never causes a sequence number to be reused.
+    """
+    today  = date.today().strftime('%Y%m%d')
+    prefix = f"{terminal_id}-{today}-"
+    row = conn.execute(
+        "SELECT MAX(CAST(SUBSTR(reference, ?) AS INTEGER)) "
+        "FROM transactions WHERE reference LIKE ?",
+        (len(prefix) + 1, f"{prefix}%")
+    ).fetchone()
+    last_seq = row[0] if row and row[0] is not None else 0
+    return f"{prefix}{last_seq + 1:04d}"
 
 
 def create(
@@ -41,19 +31,30 @@ def create(
     """
     Save a completed transaction.
     Returns the saved transaction dict including its auto-generated reference.
+    Raises on DB error; nothing is committed if any step fails.
     """
+    def _lt(item):
+        return item.get('line_total', round(item['qty'] * item['unit_price'], 2))
+
     gst = sum(
-        item['line_total'] * item.get('tax_rate', 10.0) / (100 + item.get('tax_rate', 10.0))
+        _lt(item) * item.get('tax_rate', 10.0) / (100 + item.get('tax_rate', 10.0))
         for item in items
         if item.get('tax_rate', 0) > 0
     )
-    subtotal = total - gst
-    terminal_id = _get_terminal_id()
-    reference = _next_reference(terminal_id)
+    subtotal  = total - gst
     sale_date = date.today().isoformat()
 
     conn = get_connection()
     try:
+        # Read terminal_id and generate reference in the same connection so the
+        # COUNT and INSERT are part of one implicit transaction — prevents duplicate
+        # references if two threads call create() concurrently.
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key='terminal_id'"
+        ).fetchone()
+        terminal_id = (row['value'] or 'POS-001') if row else 'POS-001'
+        reference = _generate_reference(conn, terminal_id)
+
         cur = conn.execute("""
             INSERT INTO transactions
                 (reference, shift_id, operator, sale_date, payment_method,
@@ -72,7 +73,7 @@ def create(
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, [
             (txn_id, i['barcode'], i['description'],
-             i['qty'], i['unit_price'], i.get('tax_rate', 10.0), i['line_total'])
+             i['qty'], i['unit_price'], i.get('tax_rate', 10.0), _lt(i))
             for i in items
         ])
 
@@ -90,6 +91,9 @@ def create(
             'total': round(total, 2), 'tendered': round(tendered, 2),
             'change_given': round(change_given, 2), 'items': items,
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

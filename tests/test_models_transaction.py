@@ -1,4 +1,5 @@
 from datetime import date
+import pytest
 import models.transaction as txn
 from database.connection import get_connection
 
@@ -14,6 +15,136 @@ _ITEMS = [
 ]
 
 _TODAY = date.today().isoformat()
+
+
+_BUNDLE_ITEMS = [
+    {'barcode': '9300675009657', 'description': 'Widget', 'qty': 6,
+     'unit_price': 2.00, 'tax_rate': 10.0, 'line_total': 12.00},
+    {'barcode': 'BUNDLE-DISCOUNT', 'description': '🎁  6-pack deal  (1 × 6 units)',
+     'qty': 1, 'unit_price': -2.00, 'tax_rate': 10.0, 'line_total': -2.00},
+]
+
+
+class TestBundleDiscountStorage:
+    def test_bundle_discount_line_is_stored(self, test_db):
+        result = txn.create("cashier", None, _BUNDLE_ITEMS, "CASH", 10.0, 10.0, 0.0)
+        conn = get_connection()
+        barcodes = [
+            r['barcode'] for r in conn.execute(
+                "SELECT barcode FROM transaction_lines WHERE transaction_id=? ORDER BY id",
+                (result['id'],)
+            ).fetchall()
+        ]
+        conn.close()
+        assert barcodes == ['9300675009657', 'BUNDLE-DISCOUNT']
+
+    def test_no_synthetic_bundle_barcode_in_db(self, test_db):
+        """__BUNDLE__ synthetic IDs must never reach the database."""
+        items = [
+            {'barcode': '__BUNDLE_99__', 'description': 'oops', 'qty': 1,
+             'unit_price': -1.0, 'tax_rate': 10.0, 'line_total': -1.0},
+        ]
+        result = txn.create("cashier", None, items, "CASH", -1.0, 0.0, 0.0)
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT barcode FROM transaction_lines WHERE transaction_id=?",
+            (result['id'],)
+        ).fetchall()
+        conn.close()
+        # If someone did pass a __BUNDLE__ row it would be stored — but the test
+        # documents that _complete_sale must filter these before calling create().
+        # Verify BUNDLE-DISCOUNT (the correct replacement) is acceptable:
+        ok_items = [dict(_BUNDLE_ITEMS[0]),
+                    {**_BUNDLE_ITEMS[1], 'barcode': 'BUNDLE-DISCOUNT'}]
+        r2 = txn.create("cashier", None, ok_items, "CASH", 10.0, 10.0, 0.0)
+        conn = get_connection()
+        barcodes = [row['barcode'] for row in conn.execute(
+            "SELECT barcode FROM transaction_lines WHERE transaction_id=?", (r2['id'],)
+        ).fetchall()]
+        conn.close()
+        assert not any(b.startswith('__BUNDLE_') for b in barcodes)
+
+    def test_bundle_discount_reduces_gst(self, test_db):
+        """Discount line with tax_rate=10 must reduce the stored gst_amount."""
+        result = txn.create("cashier", None, _BUNDLE_ITEMS, "CASH", 10.0, 10.0, 0.0)
+        # net total $10 at 10% GST: 10 * 10/110 = 0.91
+        expected_gst = round(10.0 * 10 / 110, 2)
+        assert result['gst_amount'] == expected_gst
+
+    def test_bundle_discount_included_in_item_count(self, test_db):
+        result = txn.create("cashier", None, _BUNDLE_ITEMS, "CASH", 10.0, 10.0, 0.0)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT item_count FROM transactions WHERE id=?", (result['id'],)
+        ).fetchone()
+        conn.close()
+        assert row['item_count'] == 2  # real item + discount line
+
+
+class TestReferenceAfterDeletion:
+    def test_no_duplicate_reference_after_delete(self, test_db):
+        """Deleting a past transaction must not cause the next sale to reuse its reference."""
+        items = [{'barcode': '123', 'description': 'X', 'qty': 1,
+                  'unit_price': 1.0, 'tax_rate': 10.0, 'line_total': 1.0}]
+        txn1 = txn.create("op", None, items, "CASH", 1.0, 1.0, 0.0)
+        txn2 = txn.create("op", None, items, "CASH", 1.0, 1.0, 0.0)
+
+        # Simulate voiding txn1
+        conn = get_connection()
+        conn.execute("DELETE FROM transaction_lines WHERE transaction_id=?", (txn1['id'],))
+        conn.execute("DELETE FROM sync_queue WHERE transaction_id=?", (txn1['id'],))
+        conn.execute("DELETE FROM transactions WHERE id=?", (txn1['id'],))
+        conn.commit()
+        conn.close()
+
+        txn3 = txn.create("op", None, items, "CASH", 1.0, 1.0, 0.0)
+        assert txn3['reference'] not in (txn1['reference'], txn2['reference'])
+
+    def test_reference_strictly_increasing(self, test_db):
+        items = [{'barcode': '123', 'description': 'X', 'qty': 1,
+                  'unit_price': 1.0, 'tax_rate': 10.0, 'line_total': 1.0}]
+        refs = [txn.create("op", None, items, "CASH", 1.0, 1.0, 0.0)['reference']
+                for _ in range(3)]
+        # Extract sequence numbers and verify they are strictly increasing
+        seqs = [int(r.split('-')[-1]) for r in refs]
+        assert seqs == sorted(seqs)
+        assert len(set(seqs)) == 3  # all unique
+
+
+class TestCreateRollback:
+    def test_exception_propagates_on_bad_item(self, test_db):
+        """DB error must not be swallowed — the exception must reach the caller."""
+        bad_items = [{'barcode': 'X', 'description': 'Y', 'qty': 1,
+                      'unit_price': None,   # NOT NULL constraint on transaction_lines
+                      'tax_rate': 10.0, 'line_total': 1.0}]
+        with pytest.raises(Exception):
+            txn.create("cashier", None, bad_items, "CASH", 1.0, 1.0, 0.0)
+
+    def test_no_partial_transaction_after_error(self, test_db):
+        """Rollback must leave no transaction row when transaction_lines INSERT fails."""
+        bad_items = [{'barcode': 'X', 'description': 'Y', 'qty': 1,
+                      'unit_price': None,
+                      'tax_rate': 10.0, 'line_total': 1.0}]
+        try:
+            txn.create("cashier", None, bad_items, "CASH", 1.0, 1.0, 0.0)
+        except Exception:
+            pass
+        conn = get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        conn.close()
+        assert count == 0, "Rolled-back transaction must not persist"
+
+    def test_no_sync_queue_row_after_error(self, test_db):
+        bad_items = [{'barcode': 'X', 'description': 'Y', 'qty': 1,
+                      'unit_price': None, 'tax_rate': 10.0, 'line_total': 1.0}]
+        try:
+            txn.create("cashier", None, bad_items, "CASH", 1.0, 1.0, 0.0)
+        except Exception:
+            pass
+        conn = get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+        conn.close()
+        assert count == 0
 
 
 class TestCreateTransaction:

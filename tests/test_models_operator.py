@@ -1,4 +1,83 @@
+import hashlib
+from unittest.mock import patch
 import models.operator as op
+from models.operator import _hash_pin, _verify_hash
+
+
+class TestConstantTimeComparison:
+    def test_pbkdf2_path_uses_hmac_compare_digest(self):
+        from unittest.mock import patch
+        import hmac as hmac_mod
+        stored = _hash_pin("1234")
+        with patch.object(hmac_mod, 'compare_digest', wraps=hmac_mod.compare_digest) as mock_cd:
+            _verify_hash("1234", stored)
+            assert mock_cd.called, "_verify_hash must use hmac.compare_digest"
+
+    def test_legacy_path_uses_hmac_compare_digest(self):
+        import hashlib, hmac as hmac_mod
+        legacy = hashlib.sha256(b"1234").hexdigest()
+        with patch.object(hmac_mod, 'compare_digest', wraps=hmac_mod.compare_digest) as mock_cd:
+            _verify_hash("1234", legacy)
+            assert mock_cd.called, "_verify_hash legacy path must use hmac.compare_digest"
+
+    def test_correct_pin_still_verified(self):
+        stored = _hash_pin("9999")
+        assert _verify_hash("9999", stored) is True
+
+    def test_wrong_pin_still_rejected(self):
+        stored = _hash_pin("9999")
+        assert _verify_hash("0000", stored) is False
+
+
+class TestPbkdf2Hashing:
+    def test_hash_format_is_pbkdf2(self, test_db):
+        op.set_pin("admin", "1234")
+        from database.connection import get_connection
+        conn = get_connection()
+        row = conn.execute("SELECT pin FROM operators WHERE username='admin'").fetchone()
+        conn.close()
+        assert ':' in row['pin'], "PIN must be stored in PBKDF2 'salt_hex:dk_hex' format"
+
+    def test_same_pin_produces_different_hashes(self):
+        h1 = _hash_pin("1234")
+        h2 = _hash_pin("1234")
+        assert h1 != h2, "Random salt must produce a different hash each time"
+
+    def test_verify_hash_accepts_pbkdf2(self):
+        stored = _hash_pin("5678")
+        assert _verify_hash("5678", stored) is True
+        assert _verify_hash("0000", stored) is False
+
+    def test_verify_hash_accepts_legacy_sha256(self):
+        legacy = hashlib.sha256(b"1234").hexdigest()
+        assert _verify_hash("1234", legacy) is True
+        assert _verify_hash("9999", legacy) is False
+
+    def test_legacy_hash_upgraded_on_login(self, test_db):
+        legacy = hashlib.sha256(b"1234").hexdigest()
+        from database.connection import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE operators SET pin=? WHERE username='admin'", (legacy,))
+        conn.commit()
+        conn.close()
+        op.verify_pin("admin", "1234")  # triggers upgrade
+        conn = get_connection()
+        row = conn.execute("SELECT pin FROM operators WHERE username='admin'").fetchone()
+        conn.close()
+        assert ':' in row['pin'], "Hash must be upgraded to PBKDF2 after successful login"
+
+    def test_legacy_wrong_pin_does_not_upgrade(self, test_db):
+        legacy = hashlib.sha256(b"1234").hexdigest()
+        from database.connection import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE operators SET pin=? WHERE username='admin'", (legacy,))
+        conn.commit()
+        conn.close()
+        op.verify_pin("admin", "9999")  # wrong pin — must not upgrade
+        conn = get_connection()
+        row = conn.execute("SELECT pin FROM operators WHERE username='admin'").fetchone()
+        conn.close()
+        assert ':' not in row['pin'], "Incorrect login must not modify the stored hash"
 
 
 class TestVerifyPin:

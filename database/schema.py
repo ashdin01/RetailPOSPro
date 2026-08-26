@@ -25,10 +25,14 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('eftpos_host',      'localhost'),
     ('eftpos_port',      '4443'),
     ('eftpos_username',  ''),
-    ('eftpos_password',  ''),
-    ('eftpos_merchant',   '00'),
-    ('expected_float',   '300.00'),
-    ('schema_version',   '1');
+    ('eftpos_password',      ''),
+    ('eftpos_merchant',      '00'),
+    ('expected_float',       '300.00'),
+    ('backoffice_api_key',   ''),
+    ('backoffice_ssl_cert',  ''),
+    ('customer_display_ads_dir',    ''),
+    ('customer_display_idle_secs',  '20'),
+    ('schema_version',       '3');
 
 CREATE TABLE IF NOT EXISTS operators (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,20 +128,33 @@ CREATE INDEX IF NOT EXISTS idx_sync_queue_txn ON sync_queue(transaction_id);
 """
 
 
+def _run_migrations(conn):
+    """Apply any pending schema migrations in version order."""
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='schema_version'"
+    ).fetchone()
+    version = int(row['value']) if row and row['value'] else 1
+
+    if version < 2:
+        pc_cols = {r[1] for r in conn.execute("PRAGMA table_info(product_cache)").fetchall()}
+        if 'group_name' not in pc_cols:
+            conn.execute("ALTER TABLE product_cache ADD COLUMN group_name TEXT DEFAULT ''")
+        conn.execute("UPDATE settings SET value='2' WHERE key='schema_version'")
+        conn.commit()
+        version = 2
+
+    if version < 3:
+        sh_cols = {r[1] for r in conn.execute("PRAGMA table_info(shifts)").fetchall()}
+        if 'float_open_variance' not in sh_cols:
+            conn.execute("ALTER TABLE shifts ADD COLUMN float_open_variance REAL DEFAULT 0")
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('expected_float', '300.00')"
+        )
+        conn.execute("UPDATE settings SET value='3' WHERE key='schema_version'")
+        conn.commit()
+
+
 def setup(conn):
     conn.executescript(SCHEMA)
     conn.commit()
-
-    # ── Migrations for existing databases ─────────────────────────────────────
-    pc_cols = {row[1] for row in conn.execute("PRAGMA table_info(product_cache)").fetchall()}
-    if 'group_name' not in pc_cols:
-        conn.execute("ALTER TABLE product_cache ADD COLUMN group_name TEXT DEFAULT ''")
-
-    sh_cols = {row[1] for row in conn.execute("PRAGMA table_info(shifts)").fetchall()}
-    if 'float_open_variance' not in sh_cols:
-        conn.execute("ALTER TABLE shifts ADD COLUMN float_open_variance REAL DEFAULT 0")
-
-    conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('expected_float', '300.00')"
-    )
-    conn.commit()
+    _run_migrations(conn)

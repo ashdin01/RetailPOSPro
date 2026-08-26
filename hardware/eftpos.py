@@ -68,16 +68,35 @@ class EFTPOSResult:
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
 
+_cached_settings: dict | None = None
+
+
 def _settings() -> dict:
+    global _cached_settings
+    if _cached_settings is not None:
+        return _cached_settings
     from database.connection import get_connection
+    from utils.credentials import get_credential
     conn = get_connection()
     try:
         rows = conn.execute(
             "SELECT key, value FROM settings WHERE key LIKE 'eftpos_%'"
         ).fetchall()
-        return {r['key']: (r['value'] or '') for r in rows}
+        s = {r['key']: (r['value'] or '') for r in rows}
     finally:
         conn.close()
+    # Prefer keyring for the password; DB may hold an empty placeholder
+    kr_pass = get_credential('eftpos_password')
+    if kr_pass is not None:
+        s['eftpos_password'] = kr_pass
+    _cached_settings = s
+    return s
+
+
+def invalidate_settings_cache():
+    """Clear the cached EFTPOS settings so the next call re-reads from DB and keyring."""
+    global _cached_settings
+    _cached_settings = None
 
 
 def is_enabled() -> bool:
@@ -165,7 +184,7 @@ class _LinklyClient:
         try:
             session_id, token = self._authenticate()
         except Exception as e:
-            logging.warning(f"[EFTPOS/Linkly] Auth failed: {e}")
+            logging.warning("[EFTPOS/Linkly] Auth failed: %s", e)
             return EFTPOSResult(EFTPOSResult.ERROR, message=f"Linkly auth failed: {e}")
 
         headers = self._auth_headers(token)
@@ -198,7 +217,7 @@ class _LinklyClient:
             )
             r.raise_for_status()
         except Exception as e:
-            logging.warning(f"[EFTPOS/Linkly] Transaction POST failed: {e}")
+            logging.warning("[EFTPOS/Linkly] Transaction POST failed: %s", e)
             return EFTPOSResult(EFTPOSResult.ERROR, message=f"Terminal unavailable: {e}")
 
         # ── Poll for result ───────────────────────────────────────────
@@ -220,7 +239,7 @@ class _LinklyClient:
                 rp.raise_for_status()
                 data = rp.json()
             except Exception as e:
-                logging.warning(f"[EFTPOS/Linkly] Poll error: {e}")
+                logging.warning("[EFTPOS/Linkly] Poll error: %s", e)
                 continue
 
             response = data.get("Response") or data.get("response") or {}
@@ -264,7 +283,7 @@ class _LinklyClient:
                 rp.raise_for_status()
                 data = rp.json()
             except Exception as e:
-                logging.warning(f"[EFTPOS/Linkly] Settlement poll error: {e}")
+                logging.warning("[EFTPOS/Linkly] Settlement poll error: %s", e)
                 continue
             response = data.get("Response") or data.get("response") or {}
             if not response:
@@ -283,7 +302,7 @@ class _LinklyClient:
                 verify=self._verify,
             )
         except Exception as e:
-            logging.debug(f"[EFTPOS/Linkly] Cancel error: {e}")
+            logging.debug("[EFTPOS/Linkly] Cancel error: %s", e)
 
     @staticmethod
     def _parse_response(resp: dict) -> EFTPOSResult:
@@ -301,12 +320,13 @@ class _LinklyClient:
                 receipt=receipt,
                 reference=rrn,
             )
-        if code in ("17", "75"):   # 17 = declined by customer, 75 = cancelled
+        if code == "17":   # 17 = customer-initiated cancel on terminal
             return EFTPOSResult(
                 EFTPOSResult.CANCELLED,
                 response_code=code,
                 message=text or "Cancelled",
             )
+        # Code 75 = PIN tries exceeded (hard issuer decline) — falls through to DECLINED below
         return EFTPOSResult(
             EFTPOSResult.DECLINED,
             response_code=code,
@@ -332,9 +352,7 @@ def process_purchase(amount_cents: int, txn_ref: str = '',
     protocol = s.get('eftpos_protocol', 'manual')
 
     if protocol == 'manual':
-        result = EFTPOSResult(EFTPOSResult.ERROR)
-        result.status = 'manual_required'
-        return result
+        return EFTPOSResult('manual_required')
 
     if protocol == 'linkly':
         ref = txn_ref or uuid.uuid4().hex[:16]
@@ -362,10 +380,8 @@ def settle_terminal() -> EFTPOSResult:
     protocol = s.get('eftpos_protocol', 'manual')
 
     if protocol == 'manual':
-        result = EFTPOSResult(EFTPOSResult.APPROVED,
-                              message="Manual mode — settle on terminal directly")
-        result.status = 'manual_required'
-        return result
+        return EFTPOSResult('manual_required',
+                            message="Manual mode — settle on terminal directly")
 
     if protocol == 'linkly':
         client = _LinklyClient(

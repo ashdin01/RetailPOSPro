@@ -14,8 +14,10 @@ Layout (landscape, touch-friendly):
 │  [Scan input] [VOID][CLR]│  [CASH] [EFTPOS]    │
 └──────────────────────────┴─────────────────────┘
 """
+import copy
 import logging
 import threading
+import uuid
 from datetime import date, datetime
 
 from PyQt6.QtWidgets import (
@@ -59,6 +61,11 @@ def _make_sep():
     s.setFrameShape(QFrame.Shape.HLine)
     s.setStyleSheet(f"color: {_BORDER};")
     return s
+
+
+def _basket_line_total(item: dict) -> float:
+    """The line total for a basket item — always qty × unit_price, rounded to cents."""
+    return round(item['qty'] * item['unit_price'], 2)
 
 
 class _CashPaymentDialog(QDialog):
@@ -667,6 +674,7 @@ class _SaleCompleteOverlay(QWidget):
 
 class POSScreen(QMainWindow):
     lock_requested       = pyqtSignal()
+    basket_changed       = pyqtSignal(list, float, float, float)  # items, subtotal, gst, total → customer display
     _health_signal       = pyqtSignal(bool)   # background thread → _set_online_status
     _store_signal        = pyqtSignal(str)    # background thread → _set_store_name
     _scale_result_signal = pyqtSignal(float)  # background thread → _on_scale_result
@@ -675,11 +683,12 @@ class POSScreen(QMainWindow):
         super().__init__()
         self._operator    = operator
         self._shift_id    = shift_id
-        self._basket: list = []   # {'barcode', 'description', 'qty', 'unit_price', 'tax_rate', 'line_total'}
+        self._basket: list = []   # {'barcode', 'description', 'qty', 'unit_price', 'tax_rate'}
         self._pending_qty = 0     # 0 means "none set"
         self._numpad_buf  = ""    # digits typed via on-screen numpad / keyboard
         self._overlay     = None  # SaleCompleteOverlay instance
         self._bundles: list = []  # active bundles from BackOfficePro [{id, name, required_qty, price, eligible:[{barcode,unit_qty}]}]
+        self._last_bundle_key: tuple = ()  # dirty key — avoids re-running bundle logic when basket unchanged
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 800)
@@ -1047,6 +1056,7 @@ class POSScreen(QMainWindow):
             conn.close()
 
         # Timer stays in the main thread — only the work runs in background threads
+        self._sync_lock = threading.Lock()
         self._sync_timer = QTimer(self)
         self._sync_timer.timeout.connect(self._background_sync)
         self._sync_timer.start(interval_ms)
@@ -1055,37 +1065,52 @@ class POSScreen(QMainWindow):
         threading.Thread(target=self._background_sync, daemon=True).start()
 
     def _background_sync(self):
-        threading.Thread(target=self._flush_sync_queue, daemon=True).start()
-        threading.Thread(target=self._sync_products_and_store, daemon=True).start()
+        # Acquire and release the lock on the same background thread so there is no
+        # cross-thread handoff. If the lock is already held, _run exits immediately.
+        def _run():
+            if not self._sync_lock.acquire(blocking=False):
+                logging.debug("[sync] Previous sync still running — skipping this cycle")
+                return
+            try:
+                t_queue = threading.Thread(target=self._flush_sync_queue, daemon=True)
+                t_cache = threading.Thread(target=self._sync_products_and_store, daemon=True)
+                t_queue.start()
+                t_cache.start()
+                t_queue.join()
+                t_cache.join()
+            finally:
+                self._sync_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _sync_products_and_store(self):
         from database.connection import get_connection
-        n = bop.sync_product_cache()
+        bop.sync_product_cache()
+        # Fetch store info over HTTP before touching the DB so no connection is
+        # held open during a network call.
+        store = bop.get_store_info()
+        # One connection: read barcodes for image sync + write store name if updated.
         conn = get_connection()
         try:
             rows = conn.execute("SELECT barcode FROM product_cache WHERE active=1").fetchall()
             barcodes = [r['barcode'] for r in rows]
-        finally:
-            conn.close()
-        if barcodes:
-            bop.sync_images(barcodes)
-        store = bop.get_store_info()
-        if store and store.get('store_name'):
-            conn = get_connection()
-            try:
+            if store and store.get('store_name'):
                 conn.execute(
                     "INSERT INTO settings (key, value) VALUES ('store_name', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (store['store_name'],)
                 )
                 conn.commit()
-            finally:
-                conn.close()
+        finally:
+            conn.close()
+        if barcodes:
+            bop.sync_images(barcodes)
+        if store and store.get('store_name'):
             self._store_signal.emit(store['store_name'])
         bundles = bop.fetch_bundles()
         if bundles is not None:
             self._bundles = bundles
-            logging.info(f"[sync] Loaded {len(bundles)} bundle(s)")
+            logging.info("[sync] Loaded %d bundle(s)", len(bundles))
 
     def _flush_sync_queue(self):
         pending = txn_model.get_pending_sync()
@@ -1108,13 +1133,14 @@ class POSScreen(QMainWindow):
                         'tax_rate':    i['tax_rate'],
                     }
                     for i in txn['items']
-                    if not str(i.get('barcode', '')).startswith('__BUNDLE_')
+                    if i.get('barcode') != 'BUNDLE-DISCOUNT'
+                    and not str(i.get('barcode', '')).startswith('__BUNDLE_')
                 ],
             }
             result = bop.post_sale(sale_data)
             if result and result.get('ok'):
                 txn_model.mark_synced(txn['id'])
-                logging.info(f"[sync] {txn['reference']} synced to BackOfficePro")
+                logging.info("[sync] %s synced to BackOfficePro", txn['reference'])
             else:
                 txn_model.mark_sync_failed(
                     txn['queue_id'],
@@ -1256,7 +1282,6 @@ class POSScreen(QMainWindow):
         for item in self._basket:
             if item['barcode'] == barcode:
                 item['qty'] = round(item['qty'] + qty, 3)
-                item['line_total'] = round(item['qty'] * item['unit_price'], 2)
                 self._refresh_basket_table()
                 return
 
@@ -1266,7 +1291,6 @@ class POSScreen(QMainWindow):
             'qty':          qty,
             'unit_price':   float(product['sell_price']),
             'tax_rate':     float(product.get('tax_rate', 10.0)),
-            'line_total':   round(qty * float(product['sell_price']), 2),
             'price_reason': '',
         })
         self._refresh_basket_table()
@@ -1366,13 +1390,23 @@ class POSScreen(QMainWindow):
                 'qty':                1,
                 'unit_price':         discount,
                 'tax_rate':           10.0,
-                'line_total':         discount,
                 'price_reason':       '',
                 'is_bundle_discount': True,
             })
 
     def _refresh_basket_table(self):
-        self._apply_bundles()
+        # Only re-evaluate bundle discounts when real basket items have changed.
+        # Bundle definition updates (from background sync) take effect on the
+        # next basket modification.
+        real_key = tuple(
+            (i['barcode'], round(i['qty'], 3), round(i['unit_price'], 4))
+            for i in self._basket
+            if not i.get('is_bundle_discount')
+        )
+        if real_key != self._last_bundle_key:
+            self._apply_bundles()
+            self._last_bundle_key = real_key
+
         self._basket_table.setRowCount(0)
         for item in self._basket:
             r = self._basket_table.rowCount()
@@ -1390,7 +1424,7 @@ class POSScreen(QMainWindow):
                 desc_item.setBackground(QColor("#0d2010"))
                 desc_item.setFont(QFont("", -1, QFont.Weight.Bold))
                 self._basket_table.setItem(r, 1, desc_item)
-                amt = QTableWidgetItem(f"−{currency(abs(item['line_total']))}")
+                amt = QTableWidgetItem(f"−{currency(abs(_basket_line_total(item)))}")
                 amt.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 amt.setForeground(QColor(_GREEN))
                 amt.setBackground(QColor("#0d2010"))
@@ -1434,7 +1468,7 @@ class POSScreen(QMainWindow):
             price_btn.clicked.connect(lambda _, row=r: self._show_price_menu(row))
             self._basket_table.setCellWidget(r, 2, price_btn)
 
-            total_item = QTableWidgetItem(currency(item['line_total']))
+            total_item = QTableWidgetItem(currency(_basket_line_total(item)))
             total_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             total_item.setForeground(QColor(_TEXT))
             self._basket_table.setItem(r, 3, total_item)
@@ -1506,19 +1540,15 @@ class POSScreen(QMainWindow):
         if adj_qty >= item['qty']:
             # Reprice the whole line
             item['unit_price']   = new_price
-            item['line_total']   = round(item['qty'] * new_price, 2)
             item['price_reason'] = new_reason
         else:
             # Split: reduce original line, insert new repriced line below it
-            import copy
             new_item = copy.copy(item)
             new_item['qty']          = round(adj_qty, 3)
             new_item['unit_price']   = new_price
-            new_item['line_total']   = round(adj_qty * new_price, 2)
             new_item['price_reason'] = new_reason
 
-            item['qty']        = round(item['qty'] - adj_qty, 3)
-            item['line_total'] = round(item['qty'] * item['unit_price'], 2)
+            item['qty'] = round(item['qty'] - adj_qty, 3)
 
             self._basket.insert(row + 1, new_item)
 
@@ -1567,9 +1597,7 @@ class POSScreen(QMainWindow):
             a_minusxx.setEnabled(False)
 
         chosen = menu.exec(QCursor.pos())
-        if chosen is None:
-            pass
-        elif chosen == a_plus1:
+        if chosen == a_plus1:
             self._adjust_basket_qty(row, 1)
         elif chosen == a_plusxx and xx is not None:
             self._adjust_basket_qty(row, xx)
@@ -1592,8 +1620,7 @@ class POSScreen(QMainWindow):
         if new_qty <= 0:
             self._basket.pop(row)
         else:
-            item['qty']        = new_qty
-            item['line_total'] = round(new_qty * item['unit_price'], 2)
+            item['qty'] = new_qty
         self._refresh_basket_table()
 
     def _void_row(self, row: int):
@@ -1612,18 +1639,19 @@ class POSScreen(QMainWindow):
 
     def _open_settings(self):
         from views.settings_screen import SettingsScreen
-        dlg = SettingsScreen(self)
+        dlg = SettingsScreen(self, operator_id=self._operator['id'])
         dlg.exec()
         self._scan_input.setFocus()
 
     def _refresh_totals(self):
-        total = round(sum(i['line_total'] for i in self._basket), 2)
+        total = round(sum(_basket_line_total(i) for i in self._basket), 2)
         gst = round(sum(
-            gst_from_total(i['line_total'], i.get('tax_rate', 10.0))
+            gst_from_total(_basket_line_total(i), i.get('tax_rate', 10.0))
             for i in self._basket
             if i.get('tax_rate', 0) > 0
         ), 2)
         subtotal = round(total - gst, 2)
+        # weighed items (fractional qty) count as 1 unit each
         n = sum(int(i['qty']) if i['qty'] == int(i['qty']) else 1 for i in self._basket)
         self._items_lbl.setText(f"Items: {len(self._basket)}  ({n} units)")
         self._subtotal_lbl.setText(f"Subtotal (ex. GST):  {currency(subtotal)}")
@@ -1633,6 +1661,7 @@ class POSScreen(QMainWindow):
         self._total_lbl.setStyleSheet(
             f"font-size: 44px; font-weight: bold; color: {color};"
         )
+        self.basket_changed.emit([dict(i) for i in self._basket], subtotal, gst, total)
 
     def _flash_not_found(self, text: str):
         self._scan_input.setStyleSheet(f"""
@@ -1669,7 +1698,7 @@ class POSScreen(QMainWindow):
     # ── Payment ───────────────────────────────────────────────────────
 
     def _total(self) -> float:
-        return round(sum(i['line_total'] for i in self._basket), 2)
+        return round(sum(_basket_line_total(i) for i in self._basket), 2)
 
     def _pay_cash(self):
         if not self._basket:
@@ -1688,7 +1717,7 @@ class POSScreen(QMainWindow):
         if not self._basket:
             return
         total   = self._total()
-        txn_ref = f"POS-{id(self) & 0xFFFF:04X}"   # lightweight pre-ref for terminal
+        txn_ref = uuid.uuid4().hex[:16]
 
         dlg = _EFTPOSDialog(total, txn_ref, self)
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
@@ -1708,13 +1737,23 @@ class POSScreen(QMainWindow):
             self._scan_input.setFocus()
 
     def _complete_sale(self, method: str, tendered: float, change: float):
-        items = list(self._basket)
         total = self._total()
+
+        # Separate real sale lines from the synthetic __BUNDLE__ discount rows that
+        # _apply_bundles() injects into the basket.  Re-add each discount as a clean
+        # BUNDLE-DISCOUNT line so receipts and reports can display it without
+        # encountering internal __BUNDLE__ identifiers.
+        real_items     = [i for i in self._basket if not i.get('is_bundle_discount')]
+        discount_lines = [
+            {**i, 'barcode': 'BUNDLE-DISCOUNT'}
+            for i in self._basket
+            if i.get('is_bundle_discount')
+        ]
 
         txn = txn_model.create(
             operator      = self._operator.get('username', 'unknown'),
             shift_id      = self._shift_id,
-            items         = items,
+            items         = real_items + discount_lines,
             payment_method= method,
             total         = total,
             tendered      = tendered,

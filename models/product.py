@@ -100,6 +100,6 @@ def _cache_product(product: dict):
         })
         conn.commit()
     except Exception as e:
-        logging.warning(f"[product cache] write failed: {e}")
+        logging.warning("[product cache] write failed: %s", e)
     finally:
         conn.close()

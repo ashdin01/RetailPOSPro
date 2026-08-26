@@ -83,7 +83,7 @@ def read_weight() -> float | None:
                 line = ser.readline().decode('ascii', errors='ignore').strip()
 
     except Exception as e:
-        logging.warning(f"[Scale] Serial error on {port}: {e}")
+        logging.warning("[Scale] Serial error on %s: %s", port, e)
         return None
 
     return _parse_weight(line)
@@ -96,7 +96,7 @@ def _parse_weight(line: str) -> float | None:
     Handles common formats:
       MT-SICS stable:   "S S +   1.234 kg"
       MT-SICS unstable: "S D +   1.234 kg"  (dynamic — still usable)
-      CAS / A&D:        "+001.234KG" or "001.234"
+      CAS / A&D:        "+001.234KG" or "+001234G" or "001.234"
       Generic:          any string containing a decimal number
     """
     if not line:
@@ -107,17 +107,28 @@ def _parse_weight(line: str) -> float | None:
         m = re.search(r'[+-]?\s*(\d+\.?\d*)\s*kg', line, re.IGNORECASE)
         if m:
             return abs(float(m.group(1)))
+        m = re.search(r'[+-]?\s*(\d+\.?\d*)\s*g\b', line, re.IGNORECASE)
+        if m:
+            return abs(float(m.group(1))) / 1000.0
 
-    # Check if unit is specified as grams — convert to kg
+    # Explicit kg unit — trust it regardless of magnitude
+    m_kg = re.search(r'[+-]?\s*(\d+\.?\d*)\s*kg', line, re.IGNORECASE)
+    if m_kg:
+        return abs(float(m_kg.group(1)))
+
+    # Explicit gram unit — convert to kg
     m_g = re.search(r'[+-]?\s*(\d+\.?\d*)\s*g\b', line, re.IGNORECASE)
     if m_g:
         return abs(float(m_g.group(1))) / 1000.0
 
-    # Generic: find first signed decimal number
+    # No unit suffix: apply a heuristic on the first decimal number found.
+    # Retail scales in continuous/unitless mode output either small decimals
+    # (e.g. 1.234, meaning kg) or large integers (e.g. 1234, meaning grams).
+    # The 5000 threshold (~5 kg) is reasonable for retail produce; it is NOT
+    # suitable for industrial scales or scales configured to output lbs.
     m = re.search(r'[+-]?\s*(\d+\.?\d+)', line)
     if m:
         val = abs(float(m.group(1)))
-        # Heuristic: if the number looks like grams (> 10000), convert
         return val / 1000.0 if val > 5000 else val
 
     return None

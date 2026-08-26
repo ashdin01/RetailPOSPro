@@ -44,20 +44,27 @@ def close_shift(shift_id: int, float_close: float = 0) -> dict:
             WHERE shift_id=? AND status='COMPLETED'
         """, (shift_id,)).fetchone()
 
-        conn.execute("""
+        cur = conn.execute("""
             UPDATE shifts SET
                 status='CLOSED', closed_at=CURRENT_TIMESTAMP,
                 float_close=?,
                 cash_sales=?, eftpos_sales=?, account_sales=?,
                 total_sales=?, transaction_count=?
-            WHERE id=?
+            WHERE id=? AND status='OPEN'
         """, (
             float_close,
             totals['cash_sales'], totals['eftpos_sales'], totals['account_sales'],
             totals['total_sales'], totals['transaction_count'],
             shift_id
         ))
+
+        if cur.rowcount == 0:
+            raise ValueError(f"Shift {shift_id} not found or already closed")
+
         conn.commit()
         return dict(totals)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
