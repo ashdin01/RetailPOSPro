@@ -5,6 +5,14 @@ on:
     tags:
       - 'v*'
 
+# softprops/action-gh-release needs write access to create the Release;
+# GitHub defaults new repos' GITHUB_TOKEN to read-only, so this is declared
+# explicitly here rather than depending on the repo's default workflow
+# permissions setting (which is what BackOfficePro's otherwise-identical
+# pipeline happens to rely on).
+permissions:
+  contents: write
+
 jobs:
   test:
     name: Run Tests
