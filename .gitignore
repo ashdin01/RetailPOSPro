@@ -21,6 +21,7 @@ data/images/
 
 # PyInstaller
 *.spec
+!RetailPOSPro.spec
 dist/
 build/
 

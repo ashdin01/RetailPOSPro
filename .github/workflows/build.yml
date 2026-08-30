@@ -1,0 +1,96 @@
+name: Build & Release RetailPOSPro
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libegl1 libgl1
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/ -q --tb=short
+
+  build-windows:
+    name: Build Windows EXE
+    needs: test          # only build if tests pass
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install build dependencies
+        run: |
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Read version
+        id: version
+        shell: python
+        run: |
+          import os
+          # read VERSION = "x.y.z" from version.py
+          ns = {}
+          exec(open('version.py').read(), ns)
+          v = ns['VERSION']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"app_version={v}\n")
+
+      - name: Build with PyInstaller
+        run: pyinstaller RetailPOSPro.spec --clean
+
+      - name: Zip release folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\RetailPOSPro\* `
+            -DestinationPath dist\RetailPOSPro-${{ steps.version.outputs.app_version }}-windows.zip
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RetailPOSPro v${{ steps.version.outputs.app_version }}
+          files: dist/RetailPOSPro-${{ steps.version.outputs.app_version }}-windows.zip
+          body: |
+            ## RetailPOSPro v${{ steps.version.outputs.app_version }}
+
+            ### Installation
+            1. Download and unzip `RetailPOSPro-${{ steps.version.outputs.app_version }}-windows.zip`
+            2. Run `RetailPOSPro.exe` — a fresh database is created automatically on first launch
+            3. No Python or installation required
+
+            ### Requirements
+            - Windows 10 or later (64-bit)
+            - No additional software needed
+            - A running BackOfficePro instance reachable over the network (configure its URL and API key under Settings on first launch)
+
+            ### Data location
+            Your local transaction database is stored in the `data\` folder
+            next to `RetailPOSPro.exe`. Back this folder up regularly.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
