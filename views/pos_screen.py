@@ -672,6 +672,35 @@ class _SaleCompleteOverlay(QWidget):
         lay.addWidget(hint)
 
 
+class _HoldConfirmedOverlay(QWidget):
+    """Full-screen flash overlay shown for ~3 s after a sale is held."""
+
+    def __init__(self, reference: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setStyleSheet(f"QWidget {{ background: #0d1a24; color: {_TEXT}; }}")
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setSpacing(20)
+
+        ok_lbl = QLabel("⏸  Sale Held")
+        ok_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ok_lbl.setStyleSheet(
+            f"font-size: 48px; font-weight: bold; color: {_ORANGE};"
+        )
+        lay.addWidget(ok_lbl)
+
+        ref_lbl = QLabel(reference)
+        ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ref_lbl.setStyleSheet(f"font-size: 32px; font-weight: bold; color: {_TEXT};")
+        lay.addWidget(ref_lbl)
+
+        hint = QLabel("Ticket printed — scan it or use Resume Sale to continue this sale later.")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet(f"font-size: 14px; color: {_DIM};")
+        lay.addWidget(hint)
+
+
 class POSScreen(QMainWindow):
     lock_requested       = pyqtSignal()
     basket_changed       = pyqtSignal(list, float, float, float)  # items, subtotal, gst, total → customer display
@@ -776,6 +805,14 @@ class POSScreen(QMainWindow):
 
         lay.addSpacing(4)
 
+        resume_btn = QPushButton("⏯ Resume Sale")
+        resume_btn.setFixedHeight(36)
+        resume_btn.setStyleSheet(hist_btn.styleSheet())
+        resume_btn.clicked.connect(self._open_resume_sale)
+        lay.addWidget(resume_btn)
+
+        lay.addSpacing(4)
+
         settings_btn = QPushButton("⚙ Settings")
         settings_btn.setFixedHeight(36)
         settings_btn.setStyleSheet(f"""
@@ -874,6 +911,17 @@ class POSScreen(QMainWindow):
         """)
         browse_btn.clicked.connect(self._open_lookup)
         bottom.addWidget(browse_btn)
+
+        hold_btn = QPushButton("⏸ Hold")
+        hold_btn.setFixedHeight(TOUCH_BTN_HEIGHT + 4)
+        hold_btn.setFixedWidth(100)
+        hold_btn.setStyleSheet(f"""
+            QPushButton {{ background: #1a2a3a; color: {_ORANGE}; border: 1px solid {_ORANGE};
+                           border-radius: 8px; font-size: 14px; font-weight: bold; }}
+            QPushButton:hover {{ background: #2a3a4a; }}
+        """)
+        hold_btn.clicked.connect(self._hold_sale)
+        bottom.addWidget(hold_btn)
 
         void_btn = QPushButton("⌦ Void Item")
         void_btn.setFixedHeight(TOUCH_BTN_HEIGHT + 4)
@@ -1246,6 +1294,11 @@ class POSScreen(QMainWindow):
             self._lookup_and_add(text)
 
     def _lookup_and_add(self, text: str):
+        # ── Hold-ticket scan (e.g. 'HLD-00001') — resume, don't add a product ──
+        if text.upper().startswith('HLD-'):
+            self._resume_by_scan(text.upper())
+            return
+
         # ── Random-weight barcode (EAN-13 starting with 2) ────────────
         weight_info = decode_weight_barcode(text)
         if weight_info:
@@ -1787,6 +1840,124 @@ class POSScreen(QMainWindow):
             self._scan_input.setFocus()
 
         QTimer.singleShot(3000, _dismiss)
+
+    def _show_hold_confirmed(self, reference: str):
+        """Show the hold-confirmed overlay for 3 seconds."""
+        if self._overlay:
+            self._overlay.hide()
+            self._overlay.deleteLater()
+        overlay = _HoldConfirmedOverlay(reference, self.centralWidget())
+        overlay.setGeometry(self.centralWidget().rect())
+        overlay.show()
+        overlay.raise_()
+        self._overlay = overlay
+
+        def _dismiss():
+            if self._overlay:
+                self._overlay.hide()
+                self._overlay.deleteLater()
+                self._overlay = None
+            self._scan_input.setFocus()
+
+        QTimer.singleShot(3000, _dismiss)
+
+    # ── Suspend / resume sale ────────────────────────────────────────
+
+    def _terminal_id(self) -> str:
+        from database.connection import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key='terminal_id'").fetchone()
+            return (row['value'] if row else None) or 'POS-001'
+        finally:
+            conn.close()
+
+    def _hold_sale(self):
+        if not self._basket:
+            return
+        reply = QMessageBox.question(
+            self, "Hold Sale", "Suspend this sale and print a resume ticket?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._scan_input.setFocus()
+            return
+
+        real_items = [i for i in self._basket if not i.get('is_bundle_discount')]
+        if not real_items:
+            self._scan_input.setFocus()
+            return  # only bundle-discount rows left — nothing real to hold
+
+        total    = self._total()
+        gst      = round(sum(
+            gst_from_total(_basket_line_total(i), i.get('tax_rate', 10.0))
+            for i in self._basket if i.get('tax_rate', 0) > 0
+        ), 2)
+        subtotal = round(total - gst, 2)
+        terminal_id = self._terminal_id()
+
+        hold = bop.create_hold(
+            terminal_id, self._operator.get('username', 'unknown'), real_items,
+            subtotal=subtotal, gst_amount=gst, total=total,
+        )
+        if not hold:
+            QMessageBox.warning(
+                self, "Hold Sale",
+                "Could not hold sale — BackOfficePro is unreachable.\n"
+                "Check the network and try again, or void the sale instead."
+            )
+            self._scan_input.setFocus()
+            return
+
+        printer.print_hold_ticket(hold['reference'], real_items, total)
+        self._basket.clear()
+        self._clear_pending_state()
+        self._refresh_basket_table()
+        self._show_hold_confirmed(hold['reference'])
+        self._scan_input.setFocus()
+
+    def _open_resume_sale(self):
+        if self._basket:
+            QMessageBox.warning(self, "Resume Sale",
+                "Clear or complete the current sale before resuming another.")
+            self._scan_input.setFocus()
+            return
+        from views.resume_sale_view import ResumeSaleView
+        dlg = ResumeSaleView(self)
+        dlg.showFullScreen()
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.resumed_hold:
+            self._restore_hold(dlg.resumed_hold)
+        self._scan_input.setFocus()
+
+    def _resume_by_scan(self, reference: str):
+        if self._basket:
+            QMessageBox.warning(self, "Resume Sale",
+                "Clear or complete the current sale before resuming another.")
+            self._scan_input.setFocus()
+            return
+        held, error = bop.resume_hold(reference, self._terminal_id())
+        if error or not held:
+            msg = {
+                'NOT_FOUND':      f"'{reference}' not found.",
+                'INVALID_STATUS': f"'{reference}' was already resumed or voided.",
+            }.get(error, "Could not reach BackOfficePro — try again.")
+            self._flash_not_found(msg)
+            return
+        self._restore_hold(held)
+
+    def _restore_hold(self, held: dict):
+        self._basket = [{
+            'barcode':      l['barcode'],
+            'description':  l['description'],
+            'qty':          l['qty'],
+            'unit_price':   l['unit_price'],
+            'tax_rate':     l['tax_rate'],
+            'price_reason': l.get('price_reason', ''),
+        } for l in held['lines']]
+        self._apply_bundles()
+        self._refresh_basket_table()
+        self._scan_input.setFocus()
 
     # ── Keyboard passthrough to scan input ────────────────────────────
 

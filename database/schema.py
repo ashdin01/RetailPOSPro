@@ -32,7 +32,11 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('backoffice_ssl_cert',  ''),
     ('customer_display_ads_dir',    ''),
     ('customer_display_idle_secs',  '20'),
-    ('schema_version',       '3');
+    ('printer_enabled',   '0'),
+    ('printer_protocol',  'manual'),
+    ('printer_host',      ''),
+    ('printer_port',      '9100'),
+    ('schema_version',       '4');
 
 CREATE TABLE IF NOT EXISTS operators (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +155,15 @@ def _run_migrations(conn):
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('expected_float', '300.00')"
         )
         conn.execute("UPDATE settings SET value='3' WHERE key='schema_version'")
+        conn.commit()
+        version = 3
+
+    if version < 4:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_enabled', '0')")
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_protocol', 'manual')")
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_host', '')")
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_port', '9100')")
+        conn.execute("UPDATE settings SET value='4' WHERE key='schema_version'")
         conn.commit()
 
 

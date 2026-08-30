@@ -203,6 +203,87 @@ def post_sale(sale_data: dict) -> dict | None:
     return None
 
 
+def create_hold(terminal_id: str, operator: str, items: list, *,
+                 subtotal: float, gst_amount: float, total: float, note: str = '') -> dict | None:
+    """Suspend a sale on BackOfficePro. Returns {'id', 'reference'} on success, None on failure."""
+    try:
+        r = requests.post(
+            f"{_api_url()}/api/v1/held-sales",
+            headers=_api_headers(),
+            json={'terminal_id': terminal_id, 'operator': operator, 'note': note,
+                  'subtotal': subtotal, 'gst_amount': gst_amount, 'total': total, 'items': items},
+            timeout=_TIMEOUT, verify=_ssl_verify(),
+        )
+        if r.status_code == 201:
+            return r.json()
+        logging.warning("[BOP API] create_hold HTTP %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logging.warning("[BOP API] create_hold: %s", e)
+    return None
+
+
+def list_open_holds() -> list | None:
+    """Returns list of open holds, or None if offline (distinct from [] = none open)."""
+    try:
+        r = requests.get(f"{_api_url()}/api/v1/held-sales",
+                          headers=_api_headers(), timeout=_TIMEOUT, verify=_ssl_verify())
+        if r.status_code == 200:
+            return r.json()
+        logging.warning("[BOP API] list_open_holds HTTP %s", r.status_code)
+    except Exception as e:
+        logging.warning("[BOP API] list_open_holds: %s", e)
+    return None
+
+
+def get_hold(reference: str) -> dict | None:
+    """Fetch a held sale's full basket by reference. Returns None if not found or offline."""
+    try:
+        r = requests.get(f"{_api_url()}/api/v1/held-sales/{reference}",
+                          headers=_api_headers(), timeout=_TIMEOUT, verify=_ssl_verify())
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logging.warning("[BOP API] get_hold(%s): %s", reference, e)
+    return None
+
+
+def resume_hold(reference: str, terminal_id: str) -> tuple:
+    """
+    Atomically claim a held sale for this terminal.
+    Returns (hold_dict, None) on success, (None, error_code) on failure —
+    error_code is 'NOT_FOUND' / 'INVALID_STATUS' / 'OFFLINE' so the caller can
+    show a specific message (e.g. 'already resumed elsewhere' vs 'not found').
+    """
+    try:
+        r = requests.post(
+            f"{_api_url()}/api/v1/held-sales/{reference}/resume",
+            headers=_api_headers(), json={'terminal_id': terminal_id},
+            timeout=_TIMEOUT, verify=_ssl_verify(),
+        )
+        if r.status_code == 200:
+            return r.json(), None
+        if r.status_code == 404:
+            return None, 'NOT_FOUND'
+        if r.status_code == 409:
+            return None, 'INVALID_STATUS'
+        logging.warning("[BOP API] resume_hold HTTP %s: %s", r.status_code, r.text[:200])
+        return None, 'ERROR'
+    except Exception as e:
+        logging.warning("[BOP API] resume_hold(%s): %s", reference, e)
+        return None, 'OFFLINE'
+
+
+def void_hold(reference: str) -> bool:
+    """Cancel a held sale outright. Returns True on success."""
+    try:
+        r = requests.post(f"{_api_url()}/api/v1/held-sales/{reference}/void",
+                           headers=_api_headers(), timeout=_TIMEOUT, verify=_ssl_verify())
+        return r.status_code == 200
+    except Exception as e:
+        logging.warning("[BOP API] void_hold(%s): %s", reference, e)
+        return False
+
+
 def get_store_info() -> dict | None:
     """Fetch store settings from BackOfficePro (name, address, phone, gst_rate)."""
     try:

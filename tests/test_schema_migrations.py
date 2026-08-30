@@ -2,9 +2,9 @@
 Tests for database/schema.py version-gated migrations.
 
 A "v1 database" is one created before migrations were version-tracked —
-it has schema_version=1 and is missing the columns added in v2 and v3.
-These tests verify that setup() detects the version and applies only the
-missing migrations, then updates schema_version to 3.
+it has schema_version=1 and is missing the columns/settings added in v2, v3
+and v4. These tests verify that setup() detects the version and applies only
+the missing migrations, then updates schema_version to 4.
 """
 import sqlite3
 import pytest
@@ -78,7 +78,7 @@ class TestNewDatabaseVersion:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 3
+        assert int(row['value']) == 4
 
     def test_new_db_has_group_name_column(self, test_db):
         from database.connection import get_connection
@@ -103,6 +103,18 @@ class TestNewDatabaseVersion:
         conn.close()
         assert row is not None
 
+    def test_new_db_has_printer_settings(self, test_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        rows = {r['key']: r['value'] for r in conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'printer_%'"
+        ).fetchall()}
+        conn.close()
+        assert rows == {
+            'printer_enabled': '0', 'printer_protocol': 'manual',
+            'printer_host': '', 'printer_port': '9100',
+        }
+
 
 class TestMigrateFromV1:
     def test_migrates_to_schema_version_3(self, v1_db):
@@ -115,7 +127,7 @@ class TestMigrateFromV1:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 3
+        assert int(row['value']) == 4
 
     def test_adds_group_name_column(self, v1_db):
         from database.connection import get_connection
@@ -150,6 +162,21 @@ class TestMigrateFromV1:
         assert row is not None
         assert row['value'] == '300.00'
 
+    def test_adds_printer_settings(self, v1_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+        conn = get_connection()
+        rows = {r['key']: r['value'] for r in conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'printer_%'"
+        ).fetchall()}
+        conn.close()
+        assert rows == {
+            'printer_enabled': '0', 'printer_protocol': 'manual',
+            'printer_host': '', 'printer_port': '9100',
+        }
+
     def test_existing_data_survives_migration(self, v1_db):
         from database.connection import get_connection
         conn = get_connection()
@@ -180,7 +207,7 @@ class TestMigrationIdempotency:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 3
+        assert int(row['value']) == 4
 
     def test_v1_migration_twice_does_not_fail(self, v1_db):
         from database.connection import get_connection
@@ -193,4 +220,4 @@ class TestMigrationIdempotency:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 3
+        assert int(row['value']) == 4

@@ -547,6 +547,141 @@ class EftposSettingsDialog(_BaseSettingsDialog):
             QMessageBox.warning(self, "EFTPOS Error", msg)
 
 
+# ── Printer settings sub-dialog ───────────────────────────────────────────────
+
+class PrinterSettingsDialog(_BaseSettingsDialog):
+    def __init__(self, parent=None):
+        super().__init__("Printer Settings", parent)
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(16)
+
+        title = QLabel("Printer Settings")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        lay.addWidget(title)
+
+        box = QGroupBox()
+        form = QFormLayout(box)
+        form.setSpacing(12)
+
+        self._enabled_chk = QCheckBox("Receipt printer connected")
+        self._enabled_chk.setStyleSheet("font-size: 14px;")
+        self._enabled_chk.stateChanged.connect(self._on_enabled_changed)
+        form.addRow("", self._enabled_chk)
+
+        self._proto_combo = QComboBox()
+        self._proto_combo.addItem("Manual (no printer / print later)", "manual")
+        self._proto_combo.addItem("ESC/POS network printer", "escpos")
+        self._proto_combo.setFixedHeight(TOUCH_BTN_HEIGHT)
+        self._proto_combo.setStyleSheet(_COMBO_STYLE)
+        self._proto_combo.currentIndexChanged.connect(self._on_proto_changed)
+        form.addRow("Protocol:", self._proto_combo)
+
+        # ESC/POS-specific fields
+        self._escpos_widget = QWidget()
+        escpos_form = QFormLayout(self._escpos_widget)
+        escpos_form.setContentsMargins(0, 0, 0, 0)
+        escpos_form.setSpacing(10)
+
+        def _ef(placeholder):
+            e = QLineEdit()
+            e.setPlaceholderText(placeholder)
+            e.setFixedHeight(TOUCH_BTN_HEIGHT)
+            e.setStyleSheet(_EDIT_STYLE)
+            return e
+
+        self._host_edit = _ef("e.g. 192.168.1.60")
+        self._port_edit = _ef("9100")
+
+        self._fields['printer_host'] = self._host_edit
+        self._fields['printer_port'] = self._port_edit
+
+        escpos_form.addRow("Printer Host:", self._host_edit)
+        escpos_form.addRow("Printer Port:", self._port_edit)
+        form.addRow("", self._escpos_widget)
+
+        test_row = QHBoxLayout()
+        self._test_btn = QPushButton("Test Print")
+        self._test_btn.setFixedHeight(TOUCH_BTN_HEIGHT)
+        self._test_btn.clicked.connect(self._test_printer)
+        test_row.addWidget(self._test_btn)
+        test_row.addStretch()
+        form.addRow("", test_row)
+
+        lay.addWidget(box)
+        lay.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, stretch=1)
+        outer.addWidget(_bottom_bar(self, self._save))
+
+    def _on_enabled_changed(self, state):
+        enabled = state == Qt.CheckState.Checked.value
+        self._proto_combo.setEnabled(enabled)
+        self._test_btn.setEnabled(enabled)
+        if enabled:
+            self._on_proto_changed()
+        else:
+            self._escpos_widget.setVisible(False)
+
+    def _on_proto_changed(self, *_):
+        self._escpos_widget.setVisible(
+            self._proto_combo.currentData() == 'escpos'
+        )
+
+    def _load(self):
+        vals = _load_settings()
+        for key, edit in self._fields.items():
+            edit.setText(vals.get(key, ''))
+        self._enabled_chk.setChecked(vals.get('printer_enabled', '0') == '1')
+        self._on_enabled_changed(
+            Qt.CheckState.Checked.value if vals.get('printer_enabled') == '1'
+            else Qt.CheckState.Unchecked.value
+        )
+        pp = vals.get('printer_protocol', 'manual')
+        for i in range(self._proto_combo.count()):
+            if self._proto_combo.itemData(i) == pp:
+                self._proto_combo.setCurrentIndex(i)
+                break
+
+    def _save(self):
+        from hardware.printer import invalidate_settings_cache
+        pairs = [(k, e.text().strip()) for k, e in self._fields.items()]
+        pairs += [
+            ('printer_enabled',  '1' if self._enabled_chk.isChecked() else '0'),
+            ('printer_protocol', self._proto_combo.currentData()),
+        ]
+        _save_settings(pairs)
+        invalidate_settings_cache()
+        QMessageBox.information(self, "Saved", "Printer settings saved.")
+
+    def _test_printer(self):
+        from hardware.printer import invalidate_settings_cache, test_connection as printer_test
+        _save_settings([
+            ('printer_host',     self._host_edit.text().strip()),
+            ('printer_port',     self._port_edit.text().strip()),
+            ('printer_protocol', self._proto_combo.currentData()),
+            ('printer_enabled',  '1'),
+        ])
+        invalidate_settings_cache()
+        ok, msg = printer_test()
+        if ok:
+            QMessageBox.information(self, "Printer OK", msg)
+        else:
+            QMessageBox.warning(self, "Printer Error", msg)
+
+
 # ── Customer Display settings sub-dialog ──────────────────────────────────────
 
 class CustomerDisplaySettingsDialog(_BaseSettingsDialog):
@@ -672,6 +807,7 @@ class SettingsScreen(QDialog):
             ("⚙",  "Terminal Settings",  lambda p: TerminalSettingsDialog(p)),
             ("⚖",  "Scale Settings",     lambda p: ScaleSettingsDialog(p)),
             ("💳", "EFTPOS Settings",    lambda p: EftposSettingsDialog(p)),
+            ("🖨",  "Printer Settings",  lambda p: PrinterSettingsDialog(p)),
             ("🖥",  "Customer Display Settings", lambda p: CustomerDisplaySettingsDialog(p)),
             # EOD receives the current operator so it filters to the right open shift
             ("📋", "End of Day",         lambda p: _EODDialogProxy(p, operator_id=self._operator_id)),
