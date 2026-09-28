@@ -12,7 +12,6 @@ import datetime
 import logging
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QGroupBox, QScrollArea,
@@ -42,12 +41,15 @@ _COINS = [
 ]
 
 _BASE_STYLE  = "QDialog, QWidget { background: #1a2332; color: #e6edf3; }"
-_EDIT_STYLE  = """
-    QLineEdit { background: #1e2a38; color: #e6edf3;
-                border: 1px solid #2a3a4a; border-radius: 6px;
-                padding: 0 10px; font-size: 15px; }
-    QLineEdit:focus { border-color: #1565c0; }
+_STEPPER_BTN_STYLE = """
+    QPushButton { background: #1e2a38; color: #e6edf3;
+                  border: 1px solid #2a3a4a; border-radius: 6px;
+                  font-size: 18px; font-weight: bold; }
+    QPushButton:pressed { background: #2a3f58; }
+    QPushButton:disabled { color: #555; }
 """
+_SUBTOTAL_STYLE_ZERO   = "font-size: 13px; font-weight: normal; color: #8b949e; min-width: 72px;"
+_SUBTOTAL_STYLE_COUNTED = "font-size: 13px; font-weight: bold; color: #4CAF50; min-width: 72px;"
 _GROUP_STYLE = "QGroupBox { font-size: 13px; font-weight: bold; color: #8b949e; " \
                "border: 1px solid #2a3a4a; border-radius: 6px; margin-top: 8px; " \
                "padding-top: 14px; }"
@@ -81,8 +83,11 @@ class EODDialog(QDialog):
         self._totals   = {}
         self._shift    = None
         self._today    = datetime.date.today().isoformat()
-        self._denom_edits  = {}   # cents_value → QLineEdit (count)
-        self._denom_labels = {}   # cents_value → QLabel (subtotal)
+        self._denom_counts     = {}   # cents_value → int count
+        self._denom_count_lbls = {}   # cents_value → QLabel (count display)
+        self._denom_labels     = {}   # cents_value → QLabel (subtotal)
+        self._denom_minus_btns = {}   # cents_value → QPushButton
+        self._denom_plus_btns  = {}   # cents_value → QPushButton
         self._settle_result = None
         self._settle_thread = None
 
@@ -289,46 +294,79 @@ class EODDialog(QDialog):
         grid = QGridLayout(grp)
         grid.setSpacing(6)
 
+        btn_size = TOUCH_BTN_HEIGHT - 12
+
         for r, (cents, label) in enumerate(denoms):
+            self._denom_counts[cents] = 0
+
             # Denomination label
             lbl = QLabel(label)
             lbl.setStyleSheet("font-size: 14px; font-weight: bold; min-width: 44px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-            # Count field
-            from PyQt6.QtWidgets import QLineEdit
-            edit = QLineEdit("0")
-            edit.setFixedHeight(TOUCH_BTN_HEIGHT)
-            edit.setFixedWidth(80)
-            edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            edit.setStyleSheet(_EDIT_STYLE)
-            edit.setValidator(QIntValidator(0, 9999, self))
-            edit.textChanged.connect(self._update_float_total)
-            self._denom_edits[cents] = edit
+            # −/+ tap-target stepper — no keyboard needed. Auto-repeat lets
+            # holding the button count up/down quickly for larger tallies
+            # (a note/coin count can easily run into the dozens), while a
+            # single tap still gives exact control.
+            minus_btn = QPushButton("−")
+            minus_btn.setFixedSize(btn_size, btn_size)
+            minus_btn.setStyleSheet(_STEPPER_BTN_STYLE)
+            minus_btn.setAutoRepeat(True)
+            minus_btn.setAutoRepeatDelay(350)
+            minus_btn.setAutoRepeatInterval(80)
+            minus_btn.clicked.connect(lambda _checked, c=cents: self._change_denom_count(c, -1))
 
-            # Subtotal label
+            count_lbl = QLabel("0")
+            count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            count_lbl.setMinimumWidth(34)
+            count_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #e6edf3;")
+            self._denom_count_lbls[cents] = count_lbl
+
+            plus_btn = QPushButton("+")
+            plus_btn.setFixedSize(btn_size, btn_size)
+            plus_btn.setStyleSheet(_STEPPER_BTN_STYLE)
+            plus_btn.setAutoRepeat(True)
+            plus_btn.setAutoRepeatDelay(350)
+            plus_btn.setAutoRepeatInterval(80)
+            plus_btn.clicked.connect(lambda _checked, c=cents: self._change_denom_count(c, 1))
+
+            self._denom_minus_btns[cents] = minus_btn
+            self._denom_plus_btns[cents]  = plus_btn
+
+            stepper = QWidget()
+            stepper_lay = QHBoxLayout(stepper)
+            stepper_lay.setContentsMargins(0, 0, 0, 0)
+            stepper_lay.setSpacing(4)
+            stepper_lay.addWidget(minus_btn)
+            stepper_lay.addWidget(count_lbl)
+            stepper_lay.addWidget(plus_btn)
+
+            # Subtotal label — bold green once this denomination has a count
             sub = QLabel("$0.00")
-            sub.setStyleSheet("font-size: 13px; color: #8b949e; min-width: 72px;")
+            sub.setStyleSheet(_SUBTOTAL_STYLE_ZERO)
             sub.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._denom_labels[cents] = sub
 
-            grid.addWidget(lbl,  r, 0)
-            grid.addWidget(edit, r, 1)
-            grid.addWidget(sub,  r, 2)
+            grid.addWidget(lbl,     r, 0)
+            grid.addWidget(stepper, r, 1)
+            grid.addWidget(sub,     r, 2)
 
         return grp
 
+    def _change_denom_count(self, cents: int, delta: int):
+        new_count = max(0, self._denom_counts[cents] + delta)
+        self._denom_counts[cents] = new_count
+        self._denom_count_lbls[cents].setText(str(new_count))
+        self._update_float_total()
+
     def _update_float_total(self):
         total_cents = 0
-        for cents, edit in self._denom_edits.items():
-            try:
-                count = int(edit.text() or '0')
-            except ValueError:
-                count = 0
+        for cents, count in self._denom_counts.items():
             sub = count * cents
             total_cents += sub
             lbl = self._denom_labels[cents]
             lbl.setText(f"${sub / 100:,.2f}")
+            lbl.setStyleSheet(_SUBTOTAL_STYLE_COUNTED if count > 0 else _SUBTOTAL_STYLE_ZERO)
 
         total = total_cents / 100
         self._float_counted = total

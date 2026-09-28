@@ -38,14 +38,56 @@ class TestRefundDialogBuild:
     def test_default_qty_is_full_remaining(self, qtbot, sale):
         dlg = RefundDialog(sale, operator='alice', shift_id=None)
         qtbot.addWidget(dlg)
-        assert dlg._spinboxes[0].value() == pytest.approx(2.0)
-        assert dlg._spinboxes[1].value() == pytest.approx(1.0)
+        assert dlg._qty_values[0] == pytest.approx(2.0)
+        assert dlg._qty_values[1] == pytest.approx(1.0)
+        assert dlg._qty_labels[0].text() == "2"
+        assert dlg._qty_labels[1].text() == "1"
 
-    def test_spinbox_max_capped_at_remaining(self, qtbot, sale):
+    def test_plus_tap_capped_at_remaining_and_disables_itself(self, qtbot, sale):
         dlg = RefundDialog(sale, operator='alice', shift_id=None)
         qtbot.addWidget(dlg)
-        dlg._spinboxes[0].setValue(999)
-        assert dlg._spinboxes[0].value() == pytest.approx(2.0)
+        # Already at the full remaining (2) by default — plus must be disabled,
+        # and a further tap (however triggered) must never exceed it.
+        assert not dlg._plus_btns[0].isEnabled()
+        dlg._change_qty(0, 999)
+        assert dlg._qty_values[0] == pytest.approx(2.0)
+
+    def test_minus_tap_floors_at_zero_and_disables_itself(self, qtbot, sale):
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        dlg._change_qty(0, -999)
+        assert dlg._qty_values[0] == pytest.approx(0.0)
+        assert dlg._qty_labels[0].text() == "0"
+        assert not dlg._minus_btns[0].isEnabled()
+
+    def test_minus_then_plus_button_click_round_trips(self, qtbot, sale):
+        """End-to-end through the actual buttons, not just _change_qty(),
+        since that's what a finger taps on the real screen."""
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        dlg._minus_btns[0].click()
+        assert dlg._qty_values[0] == pytest.approx(1.0)
+        assert dlg._qty_labels[0].text() == "1"
+        dlg._plus_btns[0].click()
+        assert dlg._qty_values[0] == pytest.approx(2.0)
+
+    def test_whole_qty_line_steps_by_one(self, qtbot, sale):
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        assert dlg._step_for(dlg._refundable[0]) == 1.0
+
+    def test_fractional_remaining_steps_by_tenth(self, qtbot, test_db):
+        weighted_sale = txn_model.create(
+            "alice", None,
+            [{'barcode': '333', 'description': 'Grapes', 'qty': 0.732,
+              'unit_price': 8.0, 'tax_rate': 10.0, 'line_total': 5.86}],
+            "CASH", 5.86, 5.86, 0.0,
+        )
+        dlg = RefundDialog(weighted_sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        assert dlg._step_for(dlg._refundable[0]) == 0.1
+        dlg._minus_btns[0].click()
+        assert dlg._qty_values[0] == pytest.approx(0.632)
 
     def test_already_refunded_line_excluded_from_table(self, qtbot, sale):
         txn_model.create_refund("alice", None, sale['reference'], [_TWO_LINES[0]])  # refunds the Milk line fully
@@ -67,8 +109,8 @@ class TestRefundDialogConfirm:
     def test_confirm_with_zero_qty_shows_warning_and_does_not_create_refund(self, qtbot, sale, monkeypatch):
         dlg = RefundDialog(sale, operator='alice', shift_id=None)
         qtbot.addWidget(dlg)
-        for spin in dlg._spinboxes.values():
-            spin.setValue(0)
+        for r in dlg._qty_values:
+            dlg._change_qty(r, -999)
         warned = []
         monkeypatch.setattr(QMessageBox, 'warning', lambda *a, **k: warned.append(a))
         dlg._confirm()
@@ -101,8 +143,8 @@ class TestRefundDialogConfirm:
     def test_partial_qty_selection_only_refunds_that_amount(self, qtbot, sale, monkeypatch):
         dlg = RefundDialog(sale, operator='alice', shift_id=None)
         qtbot.addWidget(dlg)
-        dlg._spinboxes[0].setValue(1)   # only 1 of the 2 Milk
-        dlg._spinboxes[1].setValue(0)   # none of the Bread
+        dlg._change_qty(0, -1)      # only 1 of the 2 Milk
+        dlg._change_qty(1, -999)    # none of the Bread
         monkeypatch.setattr(QMessageBox, 'question',
                              lambda *a, **k: QMessageBox.StandardButton.Yes)
         monkeypatch.setattr(QMessageBox, 'information', lambda *a, **k: None)

@@ -12,14 +12,20 @@ says remains un-refunded, purely so staff can't even try to over-refund from the
 UI — BackOfficePro independently re-validates against its own stock_movements
 ledger regardless when the refund syncs, and rejects (409) anything that slips
 through.
+
+Quantity is adjusted with large −/+ tap targets, not a QDoubleSpinBox — this
+is a touchscreen-only POS (no keyboard/mouse to rely on for a spinbox's tiny
+arrow buttons or typed entry), matching the −1/+1 stepper pattern already
+used for basket quantity adjustment in pos_screen.py.
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QDoubleSpinBox, QMessageBox,
+    QWidget, QMessageBox,
 )
 from PyQt6.QtCore import Qt
 
+from config.settings import TOUCH_BTN_HEIGHT
 import models.transaction as txn_model
 import hardware.printer as printer
 from utils.format import currency
@@ -32,7 +38,11 @@ _DIM      = "#8b949e"
 _GREEN    = "#4CAF50"
 _RED      = "#f44336"
 
-_ROW_H = 48
+_ROW_H = max(64, TOUCH_BTN_HEIGHT + 12)   # tall enough to hold the stepper buttons
+
+
+def _fmt_qty(v: float) -> str:
+    return f"{v:g}"
 
 
 class RefundDialog(QDialog):
@@ -40,12 +50,15 @@ class RefundDialog(QDialog):
         super().__init__(parent)
         self.setModal(True)
         self.setWindowTitle(f"Refund {original_txn['reference']}")
-        self.setMinimumSize(620, 480)
+        self.setMinimumSize(700, 480)
         self.setStyleSheet(f"QDialog, QWidget {{ background: {_DARK_BG}; color: {_TEXT}; }}")
         self._txn      = original_txn
         self._operator = operator or 'unknown'
         self._shift_id = shift_id
-        self._spinboxes: dict[int, QDoubleSpinBox] = {}   # row -> qty spinbox
+        self._qty_values: dict[int, float] = {}    # row -> selected refund qty
+        self._qty_labels: dict[int, QLabel] = {}    # row -> its display label
+        self._minus_btns: dict[int, QPushButton] = {}
+        self._plus_btns:  dict[int, QPushButton] = {}
 
         lines = txn_model.get_lines(original_txn['id'])
         refunded = txn_model.get_refunded_qty_by_barcode(original_txn['reference'])
@@ -82,7 +95,7 @@ class RefundDialog(QDialog):
         self._table.setColumnWidth(1, 70)
         self._table.setColumnWidth(2, 90)
         self._table.setColumnWidth(3, 100)
-        self._table.setColumnWidth(4, 110)
+        self._table.setColumnWidth(4, 2 * TOUCH_BTN_HEIGHT + 90)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -111,19 +124,8 @@ class RefundDialog(QDialog):
             self._table.setItem(r, 2, rem_item)
             self._table.setItem(r, 3, up_item)
 
-            spin = QDoubleSpinBox()
-            spin.setDecimals(3)
-            spin.setMinimum(0.0)
-            spin.setMaximum(line['remaining'])
-            spin.setValue(line['remaining'])   # default: refund everything left on this line
-            spin.setSingleStep(1.0)
-            spin.setStyleSheet(f"""
-                QDoubleSpinBox {{ background: {_DARK_BG}; color: {_TEXT};
-                                   border: 1px solid {_BORDER}; border-radius: 4px;
-                                   padding: 2px 6px; }}
-            """)
-            self._table.setCellWidget(r, 4, spin)
-            self._spinboxes[r] = spin
+            self._qty_values[r] = line['remaining']   # default: refund everything left on this line
+            self._table.setCellWidget(r, 4, self._build_stepper(r, line))
 
         lay.addWidget(self._table, stretch=1)
 
@@ -133,8 +135,6 @@ class RefundDialog(QDialog):
         self._total_lbl = QLabel()
         self._total_lbl.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {_RED};")
         lay.addWidget(self._total_lbl)
-        for spin in self._spinboxes.values():
-            spin.valueChanged.connect(self._refresh_total)
         self._refresh_total()
 
         btn_row = QHBoxLayout()
@@ -161,10 +161,71 @@ class RefundDialog(QDialog):
         btn_row.addWidget(confirm_btn)
         lay.addLayout(btn_row)
 
+    def _build_stepper(self, r: int, line: dict) -> QWidget:
+        """A large −/+ tap-target pair with a centered qty display between
+        them — no keyboard, mouse, or fiddly spinbox arrows required."""
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(4, 4, 4, 4)
+        hl.setSpacing(6)
+
+        btn_style = f"""
+            QPushButton {{ background: {_DARK_BG}; color: {_TEXT};
+                           border: 1px solid {_BORDER}; border-radius: 6px;
+                           font-size: 20px; font-weight: bold; }}
+            QPushButton:pressed {{ background: #2a3f58; }}
+            QPushButton:disabled {{ color: {_DIM}; }}
+        """
+
+        minus_btn = QPushButton("−")
+        minus_btn.setFixedSize(TOUCH_BTN_HEIGHT, TOUCH_BTN_HEIGHT)
+        minus_btn.setStyleSheet(btn_style)
+        minus_btn.clicked.connect(lambda: self._change_qty(r, -self._step_for(line)))
+
+        qty_lbl = QLabel(_fmt_qty(self._qty_values[r]))
+        qty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qty_lbl.setMinimumWidth(50)
+        qty_lbl.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {_TEXT};")
+        self._qty_labels[r] = qty_lbl
+
+        plus_btn = QPushButton("+")
+        plus_btn.setFixedSize(TOUCH_BTN_HEIGHT, TOUCH_BTN_HEIGHT)
+        plus_btn.setStyleSheet(btn_style)
+        plus_btn.clicked.connect(lambda: self._change_qty(r, self._step_for(line)))
+
+        self._minus_btns[r] = minus_btn
+        self._plus_btns[r]  = plus_btn
+        self._update_stepper_bounds(r, line)
+
+        hl.addWidget(minus_btn)
+        hl.addWidget(qty_lbl)
+        hl.addWidget(plus_btn)
+        return holder
+
+    @staticmethod
+    def _step_for(line: dict) -> float:
+        """Whole units step by 1; a weighted item's fractional remaining
+        (e.g. 0.732 kg) steps by a finer 0.1 so it stays reachable."""
+        return 1.0 if float(line['remaining']).is_integer() else 0.1
+
+    def _update_stepper_bounds(self, r: int, line: dict):
+        value = self._qty_values[r]
+        self._minus_btns[r].setEnabled(value > 1e-9)
+        self._plus_btns[r].setEnabled(value < line['remaining'] - 1e-9)
+
+    def _change_qty(self, r: int, delta: float):
+        line = self._refundable[r]
+        new_value = round(self._qty_values[r] + delta, 3)
+        new_value = max(0.0, min(line['remaining'], new_value))
+        self._qty_values[r] = new_value
+        self._qty_labels[r].setText(_fmt_qty(new_value))
+        self._update_stepper_bounds(r, line)
+        self._refresh_total()
+
     def _selected_lines(self) -> list:
         result = []
         for r, line in enumerate(self._refundable):
-            qty = self._spinboxes[r].value()
+            qty = self._qty_values[r]
             if qty <= 0:
                 continue
             unit_price = line['unit_price']
