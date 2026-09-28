@@ -203,6 +203,33 @@ def post_sale(sale_data: dict) -> dict | None:
     return None
 
 
+def post_refund(refund_data: dict) -> dict | None:
+    """
+    Post a cash refund to BackOfficePro.
+    BackOfficePro will increase stock and reverse sales_daily, validating the
+    refund against its own record of what original_reference actually sold —
+    a 409 means the refund was rejected (e.g. over-refund), not a transient
+    failure, but it's still handled the same as any other sync failure (kept
+    in the retry queue with backoff) rather than silently dropped; Transaction
+    History's stuck-row view surfaces the rejection reason for staff to act on.
+    Returns the response dict on success, None on failure.
+    """
+    try:
+        r = requests.post(
+            f"{_api_url()}/api/v1/pos/refund",
+            headers=_api_headers(),
+            json=refund_data,
+            timeout=_TIMEOUT,
+            verify=_ssl_verify(),
+        )
+        if r.status_code == 200:
+            return r.json()
+        logging.warning("[BOP API] post_refund HTTP %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logging.warning("[BOP API] post_refund: %s", e)
+    return None
+
+
 def create_hold(terminal_id: str, operator: str, items: list, *,
                  subtotal: float, gst_amount: float, total: float, note: str = '') -> dict | None:
     """Suspend a sale on BackOfficePro. Returns {'id', 'reference'} on success, None on failure."""

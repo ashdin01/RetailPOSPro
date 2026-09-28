@@ -16,6 +16,7 @@ Layout (landscape, touch-friendly):
 """
 import copy
 import logging
+import re
 import threading
 import uuid
 from datetime import date, datetime
@@ -54,6 +55,15 @@ _GREEN     = "#4CAF50"
 _BLUE      = "#2196F3"
 _ORANGE    = "#FF9800"
 _RED       = "#f44336"
+
+# A printed sale or refund receipt's own reference, e.g. "POS-001-20260928-0001"
+# or "RFD-POS-001-20260928-0001" (models.transaction._generate_reference's
+# {prefix}-{YYYYMMDD}-{seq} shape). The prefix itself may contain hyphens
+# (terminal_id defaults to "POS-001"), so the middle segment allows them too —
+# what actually identifies a receipt reference is the trailing
+# -{8 digits}-{4 digits}. Scanning one back in reopens it instead of being
+# treated as a product barcode.
+_RECEIPT_REFERENCE_RE = re.compile(r'^(RFD-)?[A-Za-z0-9-]+-\d{8}-\d{4}$')
 
 
 def _make_sep():
@@ -705,6 +715,7 @@ class POSScreen(QMainWindow):
     lock_requested       = pyqtSignal()
     basket_changed       = pyqtSignal(list, float, float, float)  # items, subtotal, gst, total → customer display
     _health_signal       = pyqtSignal(bool)   # background thread → _set_online_status
+    _queue_depth_signal  = pyqtSignal(int)    # background thread → _set_pending_count
     _store_signal        = pyqtSignal(str)    # background thread → _set_store_name
     _scale_result_signal = pyqtSignal(float)  # background thread → _on_scale_result
 
@@ -718,11 +729,14 @@ class POSScreen(QMainWindow):
         self._overlay     = None  # SaleCompleteOverlay instance
         self._bundles: list = []  # active bundles from BackOfficePro [{id, name, required_qty, price, eligible:[{barcode,unit_qty}]}]
         self._last_bundle_key: tuple = ()  # dirty key — avoids re-running bundle logic when basket unchanged
+        self._last_health_ok    = False  # most recent /health result
+        self._pending_sync_count = 0     # most recent sync_queue depth
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 800)
 
         self._health_signal.connect(self._set_online_status)
+        self._queue_depth_signal.connect(self._set_pending_count)
         self._store_signal.connect(self._set_store_name)
         self._scale_result_signal.connect(self._on_scale_result)
 
@@ -1079,17 +1093,33 @@ class POSScreen(QMainWindow):
         def _run():
             ok = bop.check_health()
             self._health_signal.emit(ok)
+            # Queue depth is checked on the same 10s cadence so a bad API key
+            # (server reachable, every sale rejected) shows up in the header
+            # almost immediately — it doesn't depend on the health check at
+            # all, since /health is exempt from API-key auth and would stay
+            # green even while every real sale fails to sync.
+            self._queue_depth_signal.emit(txn_model.get_pending_sync_count())
         threading.Thread(target=_run, daemon=True).start()
 
     def _set_online_status(self, online: bool):
-        if online:
-            self._status_dot.setStyleSheet(f"font-size: 14px; color: {_GREEN};")
-            self._status_lbl.setText("BackOfficePro")
-            self._status_lbl.setStyleSheet(f"font-size: 12px; color: {_GREEN};")
+        self._last_health_ok = online
+        self._refresh_status_display()
+
+    def _set_pending_count(self, count: int):
+        self._pending_sync_count = count
+        self._refresh_status_display()
+
+    def _refresh_status_display(self):
+        if not self._last_health_ok:
+            color, text = _RED, "Offline"
+        elif self._pending_sync_count > 0:
+            n = self._pending_sync_count
+            color, text = _ORANGE, f"BackOfficePro — {n} pending"
         else:
-            self._status_dot.setStyleSheet(f"font-size: 14px; color: {_RED};")
-            self._status_lbl.setText("Offline")
-            self._status_lbl.setStyleSheet(f"font-size: 12px; color: {_RED};")
+            color, text = _GREEN, "BackOfficePro"
+        self._status_dot.setStyleSheet(f"font-size: 14px; color: {color};")
+        self._status_lbl.setText(text)
+        self._status_lbl.setStyleSheet(f"font-size: 12px; color: {color};")
 
     def _start_sync_worker(self):
         """Set up periodic sync timer in main thread; run first sync in background."""
@@ -1163,29 +1193,10 @@ class POSScreen(QMainWindow):
     def _flush_sync_queue(self):
         pending = txn_model.get_pending_sync()
         for txn in pending:
-            sale_data = {
-                'reference':      txn['reference'],
-                'sale_date':      txn['sale_date'],
-                'operator':       txn['operator'],
-                'payment_method': txn['payment_method'],
-                'subtotal':       txn['subtotal'],
-                'gst_amount':     txn['gst_amount'],
-                'total':          txn['total'],
-                'items': [
-                    {
-                        'barcode':     i['barcode'],
-                        'description': i['description'],
-                        'qty':         i['qty'],
-                        'unit_price':  i['unit_price'],
-                        'line_total':  i['line_total'],
-                        'tax_rate':    i['tax_rate'],
-                    }
-                    for i in txn['items']
-                    if i.get('barcode') != 'BUNDLE-DISCOUNT'
-                    and not str(i.get('barcode', '')).startswith('__BUNDLE_')
-                ],
-            }
-            result = bop.post_sale(sale_data)
+            if txn.get('transaction_type') == 'REFUND':
+                result = bop.post_refund(self._refund_sync_payload(txn))
+            else:
+                result = bop.post_sale(self._sale_sync_payload(txn))
             if result and result.get('ok'):
                 txn_model.mark_synced(txn['id'])
                 logging.info("[sync] %s synced to BackOfficePro", txn['reference'])
@@ -1194,6 +1205,58 @@ class POSScreen(QMainWindow):
                     txn['queue_id'],
                     str(result) if result else "No response"
                 )
+
+    @staticmethod
+    def _sale_sync_payload(txn: dict) -> dict:
+        return {
+            'reference':      txn['reference'],
+            'sale_date':      txn['sale_date'],
+            'operator':       txn['operator'],
+            'payment_method': txn['payment_method'],
+            'subtotal':       txn['subtotal'],
+            'gst_amount':     txn['gst_amount'],
+            'total':          txn['total'],
+            'items': [
+                {
+                    'barcode':     i['barcode'],
+                    'description': i['description'],
+                    'qty':         i['qty'],
+                    'unit_price':  i['unit_price'],
+                    'line_total':  i['line_total'],
+                    'tax_rate':    i['tax_rate'],
+                }
+                for i in txn['items']
+                if i.get('barcode') != 'BUNDLE-DISCOUNT'
+                and not str(i.get('barcode', '')).startswith('__BUNDLE_')
+            ],
+        }
+
+    @staticmethod
+    def _refund_sync_payload(txn: dict) -> dict:
+        """Local refund rows store negative qty/totals (the standard POS
+        refund-line convention — see models.transaction.create_refund); the
+        wire format to BackOfficePro's /api/v1/pos/refund is the sale-shaped
+        positive-magnitude convention its stock-reversal validation expects."""
+        return {
+            'reference':          txn['reference'],
+            'original_reference': txn['refund_of_reference'],
+            'refund_date':        txn['sale_date'],
+            'operator':           txn['operator'],
+            'subtotal':           abs(txn['subtotal']),
+            'gst_amount':         abs(txn['gst_amount']),
+            'total':              abs(txn['total']),
+            'lines': [
+                {
+                    'barcode':     i['barcode'],
+                    'description': i['description'],
+                    'qty':         abs(i['qty']),
+                    'line_total':  abs(i['line_total']),
+                }
+                for i in txn['items']
+                if i.get('barcode') != 'BUNDLE-DISCOUNT'
+                and not str(i.get('barcode', '')).startswith('__BUNDLE_')
+            ],
+        }
 
     def _refresh_store_name(self):
         from database.connection import get_connection
@@ -1297,6 +1360,11 @@ class POSScreen(QMainWindow):
         # ── Hold-ticket scan (e.g. 'HLD-00001') — resume, don't add a product ──
         if text.upper().startswith('HLD-'):
             self._resume_by_scan(text.upper())
+            return
+
+        # ── Receipt barcode (a past sale or refund's own reference) — reopen it ──
+        if _RECEIPT_REFERENCE_RE.match(text.upper()):
+            self._reopen_by_scan(text.upper())
             return
 
         # ── Random-weight barcode (EAN-13 starting with 2) ────────────
@@ -1686,7 +1754,10 @@ class POSScreen(QMainWindow):
 
     def _open_history(self):
         from views.transaction_history import TransactionHistory
-        dlg = TransactionHistory(self)
+        dlg = TransactionHistory(
+            self, operator=self._operator.get('username', 'unknown'),
+            shift_id=self._shift_id,
+        )
         dlg.exec()
         self._scan_input.setFocus()
 
@@ -1928,6 +1999,19 @@ class POSScreen(QMainWindow):
         dlg.showFullScreen()
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.resumed_hold:
             self._restore_hold(dlg.resumed_hold)
+        self._scan_input.setFocus()
+
+    def _reopen_by_scan(self, reference: str):
+        txn = txn_model.get_by_reference(reference)
+        if not txn:
+            self._flash_not_found(f"'{reference}' not found.")
+            return
+        from views.transaction_history import TransactionDetailDialog
+        dlg = TransactionDetailDialog(
+            txn, self, operator=self._operator.get('username', 'unknown'),
+            shift_id=self._shift_id,
+        )
+        dlg.exec()
         self._scan_input.setFocus()
 
     def _resume_by_scan(self, reference: str):

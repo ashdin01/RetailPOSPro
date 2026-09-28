@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QWidget,
-    QLineEdit, QFrame, QAbstractItemView, QSizePolicy,
+    QLineEdit, QFrame, QAbstractItemView, QSizePolicy, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont
@@ -44,6 +44,23 @@ def _lbl(text, size=13, color=_TEXT, bold=False) -> QLabel:
     return l
 
 
+def _sync_state(txn: dict) -> tuple:
+    """Return (state, color, tooltip) describing a transaction's sync status.
+
+    'stuck' means it has failed to sync SYNC_STUCK_ATTEMPTS+ times in a row —
+    it is still being retried automatically (with backoff), just not
+    succeeding; the tooltip/detail view surface the actual error so staff
+    don't have to guess.
+    """
+    if txn.get('synced'):
+        return 'synced', _GREEN, 'Synced to BackOfficePro'
+    attempts = txn.get('sync_attempts') or 0
+    if attempts >= txn_model.SYNC_STUCK_ATTEMPTS:
+        err = txn.get('sync_last_error') or 'unknown error'
+        return 'stuck', _RED, f"Failing to sync ({attempts} attempts) — {err}"
+    return 'pending', _ORANGE, 'Pending sync'
+
+
 # ── Date-range quick-select helpers ──────────────────────────────────────────
 
 _RANGES = [
@@ -57,15 +74,46 @@ _RANGES = [
 
 # ── Transaction detail dialog ─────────────────────────────────────────────────
 
-class _DetailDialog(QDialog):
-    def __init__(self, txn: dict, parent=None):
+class TransactionDetailDialog(QDialog):
+    """Shows one transaction's line items, totals, and sync state.
+
+    Reused from two places: TransactionHistory's row-tap (_on_row_tapped
+    below) and POSScreen's scan-to-reopen handling
+    (views/pos_screen.py:_reopen_by_scan) when a receipt barcode is scanned
+    at the till — it needs no parent list dialog, just a transaction dict
+    shaped like one row of models.transaction.get_history()/get_by_reference().
+    """
+
+    def __init__(self, txn: dict, parent=None, on_change=None, operator=None, shift_id=None):
         super().__init__(parent)
         self.setModal(True)
         self.setWindowTitle(f"Transaction {txn['reference']}")
-        self.setMinimumSize(680, 520)
+        self.setMinimumSize(680, 560)
         self.setStyleSheet(f"QDialog, QWidget {{ background: {_DARK_BG}; color: {_TEXT}; }}")
         self._txn = txn
+        self._on_change = on_change  # called after a successful retry/refund, to refresh the parent table
+        self._operator = operator    # who's refunding — passed through to RefundDialog
+        self._shift_id = shift_id
         self._build()
+
+    def _retry_sync(self):
+        txn_model.force_retry(self._txn['id'])
+        QMessageBox.information(
+            self, "Retry queued",
+            f"{self._txn['reference']} will be retried on the next sync cycle "
+            "(within a few seconds if BackOfficePro is reachable)."
+        )
+        if self._on_change:
+            self._on_change()
+        self.accept()
+
+    def _open_refund(self):
+        from views.refund_dialog import RefundDialog
+        dlg = RefundDialog(self._txn, self, operator=self._operator, shift_id=self._shift_id)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._on_change:
+                self._on_change()
+            self.accept()
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -89,6 +137,8 @@ class _DetailDialog(QDialog):
         hdr.addWidget(close_btn)
         lay.addLayout(hdr)
 
+        lines = txn_model.get_lines(self._txn['id'])
+
         # ── Meta row ──────────────────────────────────────────────────
         meta = QHBoxLayout()
         meta.setSpacing(28)
@@ -96,17 +146,60 @@ class _DetailDialog(QDialog):
         meta.addWidget(_lbl(f"👤 {self._txn['operator']}", color=_DIM))
         pmt_color = _GREEN if self._txn['payment_method'] == 'CASH' else _BLUE
         meta.addWidget(_lbl(self._txn['payment_method'], color=pmt_color, bold=True))
-        sync_text = "✓ Synced" if self._txn.get('synced') else "⏳ Pending"
-        sync_color = _GREEN if self._txn.get('synced') else _ORANGE
-        meta.addWidget(_lbl(sync_text, color=sync_color))
+        if self._txn.get('transaction_type') == 'REFUND':
+            meta.addWidget(_lbl("REFUND", color=_RED, bold=True))
+        state, sync_color, sync_tip = _sync_state(self._txn)
+        sync_text = {"synced": "✓ Synced", "pending": "⏳ Pending", "stuck": "⚠ Failing to sync"}[state]
+        sync_lbl = _lbl(sync_text, color=sync_color)
+        sync_lbl.setToolTip(sync_tip)
+        meta.addWidget(sync_lbl)
+        if state != 'synced':
+            retry_btn = QPushButton("🔁 Retry Sync")
+            retry_btn.setFixedHeight(30)
+            retry_btn.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {_BLUE};
+                               border: 1px solid {_BLUE}; border-radius: 5px;
+                               font-size: 12px; padding: 0 10px; }}
+                QPushButton:hover {{ background: {_BLUE}; color: white; }}
+            """)
+            retry_btn.clicked.connect(self._retry_sync)
+            meta.addWidget(retry_btn)
         meta.addStretch()
         lay.addLayout(meta)
+
+        # ── Refund row (SALE transactions only) ─────────────────────────
+        if self._txn.get('transaction_type', 'SALE') == 'SALE':
+            refund_row = QHBoxLayout()
+            if self._txn['payment_method'] != 'CASH':
+                refund_row.addWidget(_lbl(
+                    "EFTPOS sale — process the card refund manually on the "
+                    "terminal, then use Stock Adjust if stock needs correcting.",
+                    color=_DIM,
+                ))
+            else:
+                refunded = txn_model.get_refunded_qty_by_barcode(self._txn['reference'])
+                remaining = any(
+                    refunded.get(l['barcode'], 0.0) < l['qty'] - 1e-9 for l in lines
+                )
+                if remaining:
+                    refund_btn = QPushButton("↩  Refund")
+                    refund_btn.setFixedHeight(34)
+                    refund_btn.setStyleSheet(f"""
+                        QPushButton {{ background: transparent; color: {_RED};
+                                       border: 1px solid {_RED}; border-radius: 6px;
+                                       font-size: 13px; padding: 0 14px; }}
+                        QPushButton:hover {{ background: {_RED}; color: white; }}
+                    """)
+                    refund_btn.clicked.connect(self._open_refund)
+                    refund_row.addWidget(refund_btn)
+                else:
+                    refund_row.addWidget(_lbl("Fully refunded", color=_DIM))
+            refund_row.addStretch()
+            lay.addLayout(refund_row)
 
         lay.addWidget(_sep())
 
         # ── Line items table ──────────────────────────────────────────
-        lines = txn_model.get_lines(self._txn['id'])
-
         tbl = QTableWidget()
         tbl.setColumnCount(4)
         tbl.setHorizontalHeaderLabels(["Description", "Qty", "Unit Price", "Line Total"])
@@ -190,11 +283,13 @@ class _DetailDialog(QDialog):
 # ── Transaction history main dialog ──────────────────────────────────────────
 
 class TransactionHistory(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, operator=None, shift_id=None):
         super().__init__(parent)
         self.setModal(True)
         self.setWindowTitle("Transaction History")
         self.setStyleSheet(f"QDialog, QWidget {{ background: {_DARK_BG}; color: {_TEXT}; }}")
+        self._operator = operator   # passed through to TransactionDetailDialog for refund creation
+        self._shift_id = shift_id
 
         self._date_from = date.today()
         self._date_to   = date.today()
@@ -250,6 +345,19 @@ class TransactionHistory(QDialog):
 
         lay.addSpacing(16)
 
+        retry_all_btn = QPushButton("🔁 Retry All Failed")
+        retry_all_btn.setFixedHeight(38)
+        retry_all_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {_BLUE};
+                           border: 1px solid {_BLUE}; border-radius: 6px;
+                           font-size: 13px; padding: 0 16px; }}
+            QPushButton:hover {{ background: {_BLUE}; color: white; }}
+        """)
+        retry_all_btn.clicked.connect(self._retry_all)
+        lay.addWidget(retry_all_btn)
+
+        lay.addSpacing(8)
+
         close_btn = QPushButton("✕  Close")
         close_btn.setFixedHeight(38)
         close_btn.setStyleSheet(f"""
@@ -261,6 +369,18 @@ class TransactionHistory(QDialog):
         close_btn.clicked.connect(self.accept)
         lay.addWidget(close_btn)
         return bar
+
+    def _retry_all(self):
+        n = txn_model.force_retry_all()
+        if n:
+            QMessageBox.information(
+                self, "Retry queued",
+                f"{n} sale{'s' if n != 1 else ''} queued for retry — they'll sync "
+                "on the next cycle (within a few seconds if BackOfficePro is reachable)."
+            )
+        else:
+            QMessageBox.information(self, "Nothing to retry", "All sales are already synced.")
+        self._load()
 
     def _build_filter_bar(self) -> QWidget:
         bar = QWidget()
@@ -406,6 +526,13 @@ class TransactionHistory(QDialog):
 
     def _populate_table(self, txns: list):
         self._txns = txns
+        # The "no transactions found" placeholder below spans row 0 across
+        # every column. QTableWidget spans persist across setRowCount()/
+        # setItem() calls, so without clearing it here, the next reload that
+        # actually has rows would leave row 0's columns 1-5 invisible — the
+        # cell exists and holds the right data, it's just hidden inside a
+        # leftover 6-column merge from the previous empty result.
+        self._table.clearSpans()
         self._table.setRowCount(len(txns))
         for r, txn in enumerate(txns):
             # Date/time: use created_at if available, else sale_date
@@ -433,10 +560,11 @@ class TransactionHistory(QDialog):
                 currency(txn['total']),
                 align=Qt.AlignmentFlag.AlignRight,
             ))
+            _state, _color, _tip = _sync_state(txn)
             dot = QTableWidgetItem("●")
             dot.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            dot.setForeground(QColor(_GREEN if txn.get('synced') else _ORANGE))
-            dot.setToolTip("Synced to BackOfficePro" if txn.get('synced') else "Pending sync")
+            dot.setForeground(QColor(_color))
+            dot.setToolTip(_tip)
             self._table.setItem(r, 5, dot)
 
         if not txns:
@@ -461,7 +589,10 @@ class TransactionHistory(QDialog):
         if not hasattr(self, '_txns') or row >= len(self._txns):
             return
         txn = self._txns[row]
-        dlg = _DetailDialog(txn, self)
+        dlg = TransactionDetailDialog(
+            txn, self, on_change=self._load,
+            operator=self._operator, shift_id=self._shift_id,
+        )
         dlg.exec()
 
     # ── Keyboard ──────────────────────────────────────────────────────

@@ -36,7 +36,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('printer_protocol',  'manual'),
     ('printer_host',      ''),
     ('printer_port',      '9100'),
-    ('schema_version',       '4');
+    ('schema_version',       '6');
 
 CREATE TABLE IF NOT EXISTS operators (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     item_count      INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'COMPLETED',
     synced          INTEGER NOT NULL DEFAULT 0,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    transaction_type   TEXT NOT NULL DEFAULT 'SALE',
+    refund_of_reference TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_date   ON transactions(sale_date);
@@ -125,7 +127,9 @@ CREATE TABLE IF NOT EXISTS sync_queue (
     transaction_id INTEGER NOT NULL REFERENCES transactions(id),
     queued_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     attempts       INTEGER NOT NULL DEFAULT 0,
-    last_error     TEXT
+    last_error     TEXT,
+    next_retry_at   DATETIME,
+    last_attempt_at DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_queue_txn ON sync_queue(transaction_id);
@@ -164,6 +168,31 @@ def _run_migrations(conn):
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_host', '')")
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('printer_port', '9100')")
         conn.execute("UPDATE settings SET value='4' WHERE key='schema_version'")
+        conn.commit()
+        version = 4
+
+    if version < 5:
+        sq_cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_queue)").fetchall()}
+        if 'next_retry_at' not in sq_cols:
+            conn.execute("ALTER TABLE sync_queue ADD COLUMN next_retry_at DATETIME")
+        if 'last_attempt_at' not in sq_cols:
+            conn.execute("ALTER TABLE sync_queue ADD COLUMN last_attempt_at DATETIME")
+        # Previously-abandoned rows (attempts >= 5 under the old hard cutoff) become
+        # retry-eligible again immediately — nothing should stay stuck forever.
+        conn.execute("UPDATE sync_queue SET next_retry_at = NULL")
+        conn.execute("UPDATE settings SET value='5' WHERE key='schema_version'")
+        conn.commit()
+        version = 5
+
+    if version < 6:
+        t_cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+        if 'transaction_type' not in t_cols:
+            conn.execute(
+                "ALTER TABLE transactions ADD COLUMN transaction_type TEXT NOT NULL DEFAULT 'SALE'"
+            )
+        if 'refund_of_reference' not in t_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN refund_of_reference TEXT")
+        conn.execute("UPDATE settings SET value='6' WHERE key='schema_version'")
         conn.commit()
 
 

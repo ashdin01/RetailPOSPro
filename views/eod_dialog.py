@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 from config.settings import TOUCH_BTN_HEIGHT
 from database.connection import get_connection
 import models.shift as shift_model
+import models.transaction as txn_model
 
 # ── Australian denominations: (value_in_cents, display_label) ────────────────
 _NOTES = [
@@ -584,6 +585,23 @@ class EODDialog(QDialog):
             QMessageBox.warning(self, "No Open Shift",
                                 "There is no open shift to close.")
             return
+
+        pending = txn_model.get_pending_sync_count()
+        if pending:
+            reply = QMessageBox.question(
+                self, "Sales Not Synced",
+                f"{pending} sale{'s' if pending != 1 else ''} " +
+                ("haven't" if pending != 1 else "hasn't") +
+                " synced to BackOfficePro yet.\n\n"
+                "They'll keep retrying automatically, but it's worth checking "
+                "Transaction History → Retry All Failed, or your internet/API "
+                "key, before you close for the day.\n\n"
+                "Close shift anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         float_counted = getattr(self, '_float_counted', 0.0)
 

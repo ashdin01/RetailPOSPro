@@ -194,6 +194,128 @@ class TestCreateTransaction:
         conn.close()
         assert row is not None
 
+    def test_defaults_to_sale_type_with_no_refund_link(self, test_db):
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT transaction_type, refund_of_reference FROM transactions WHERE id=?",
+            (result["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["transaction_type"] == "SALE"
+        assert row["refund_of_reference"] is None
+
+
+_REFUND_LINES = [{
+    "barcode": "9300675009657", "description": "Test Apples",
+    "qty": 1.0, "unit_price": 10.0, "tax_rate": 10.0, "line_total": 10.0,
+}]
+
+
+class TestCreateRefund:
+    def test_stores_negative_amounts(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        assert refund["total"] == -10.0
+        assert refund["subtotal"] == pytest.approx(-(10.0 - round(10.0 * 10 / 110, 2)))
+        assert refund["gst_amount"] == -round(10.0 * 10 / 110, 2)
+
+    def test_stores_negative_line_qty_and_total(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        lines = txn.get_lines(refund["id"])
+        assert lines[0]["qty"] == -1.0
+        assert lines[0]["line_total"] == -10.0
+        # unit_price stays positive — a per-unit reference price, not a direction
+        assert lines[0]["unit_price"] == 10.0
+
+    def test_is_always_cash_with_no_tender(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "EFTPOS", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        assert refund["payment_method"] == "CASH"
+        assert refund["tendered"] == 0.0
+        assert refund["change_given"] == 0.0
+
+    def test_transaction_type_and_refund_link_stored(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT transaction_type, refund_of_reference FROM transactions WHERE id=?",
+            (refund["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["transaction_type"] == "REFUND"
+        assert row["refund_of_reference"] == sale["reference"]
+
+    def test_reference_uses_rfd_prefix_and_is_distinct_sequence(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund1 = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        refund2 = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        assert refund1["reference"].startswith("RFD-POS-001-")
+        assert refund1["reference"] != refund2["reference"]
+        assert refund1["reference"] != sale["reference"]
+
+    def test_queued_for_sync(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id FROM sync_queue WHERE transaction_id=?", (refund["id"],)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+
+    def test_returned_items_reflect_negative_signage(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        assert refund["items"][0]["qty"] == -1.0
+        assert refund["items"][0]["line_total"] == -10.0
+
+
+class TestGetByReference:
+    def test_finds_a_sale(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        found = txn.get_by_reference(sale["reference"])
+        assert found is not None
+        assert found["id"] == sale["id"]
+
+    def test_finds_a_refund(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        refund = txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        found = txn.get_by_reference(refund["reference"])
+        assert found is not None
+        assert found["transaction_type"] == "REFUND"
+
+    def test_unknown_reference_returns_none(self, test_db):
+        assert txn.get_by_reference("POS-001-20000101-9999") is None
+
+    def test_includes_sync_state_columns(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        found = txn.get_by_reference(sale["reference"])
+        assert "sync_attempts" in found
+        assert "sync_next_retry_at" in found
+
+
+class TestGetRefundedQtyByBarcode:
+    def test_no_refunds_returns_empty_dict(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        assert txn.get_refunded_qty_by_barcode(sale["reference"]) == {}
+
+    def test_sums_qty_across_multiple_partial_refunds(self, test_db):
+        sale = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        txn.create_refund("cashier", None, sale["reference"], _REFUND_LINES)
+        result = txn.get_refunded_qty_by_barcode(sale["reference"])
+        assert result["9300675009657"] == 2.0
+
+    def test_scoped_to_the_given_original_reference_only(self, test_db):
+        sale1 = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        sale2 = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        txn.create_refund("cashier", None, sale1["reference"], _REFUND_LINES)
+        result = txn.get_refunded_qty_by_barcode(sale2["reference"])
+        assert result == {}
+
 
 class TestGetHistory:
     def test_transaction_appears_in_history(self, test_db):
@@ -221,6 +343,19 @@ class TestGetHistory:
 
     def test_returns_list(self, test_db):
         assert isinstance(txn.get_history(_TODAY, _TODAY), list)
+
+    def test_includes_sync_state_columns(self, test_db):
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        conn = get_connection()
+        qid = conn.execute(
+            "SELECT id FROM sync_queue WHERE transaction_id=?", (result["id"],)
+        ).fetchone()["id"]
+        conn.close()
+        txn.mark_sync_failed(qid, "boom")
+        row = next(h for h in txn.get_history(_TODAY, _TODAY) if h["id"] == result["id"])
+        assert row["sync_attempts"] == 1
+        assert row["sync_last_error"] == "boom"
+        assert row["sync_next_retry_at"] is not None
 
 
 class TestGetLines:
@@ -310,3 +445,85 @@ class TestSyncQueue:
         match = next(p for p in pending if p["id"] == result["id"])
         assert len(match["items"]) == 1
         assert match["items"][0]["barcode"] == "9300675009657"
+
+    def _queue_id(self, transaction_id):
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id FROM sync_queue WHERE transaction_id=?", (transaction_id,)
+        ).fetchone()
+        conn.close()
+        return row["id"]
+
+    def test_mark_sync_failed_schedules_backoff(self, test_db):
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        qid = self._queue_id(result["id"])
+        txn.mark_sync_failed(qid, "401 unauthorized")
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT next_retry_at, last_attempt_at FROM sync_queue WHERE id=?", (qid,)
+        ).fetchone()
+        conn.close()
+        assert row["next_retry_at"] is not None
+        assert row["last_attempt_at"] is not None
+
+    def test_pending_excludes_row_during_backoff(self, test_db):
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        qid = self._queue_id(result["id"])
+        txn.mark_sync_failed(qid, "401 unauthorized")
+        pending = txn.get_pending_sync()
+        assert not any(p["id"] == result["id"] for p in pending)
+
+    def test_pending_sync_never_permanently_excluded(self, test_db):
+        """A transaction that has failed far more than the old 5-attempt cutoff
+        must still be retried once its backoff window has passed — no
+        transaction may ever be excluded from get_pending_sync() for good."""
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        qid = self._queue_id(result["id"])
+        for _ in range(20):
+            txn.mark_sync_failed(qid, "still failing")
+        conn = get_connection()
+        row = conn.execute("SELECT attempts FROM sync_queue WHERE id=?", (qid,)).fetchone()
+        assert row["attempts"] == 20
+        # Simulate the backoff window having elapsed.
+        conn.execute(
+            "UPDATE sync_queue SET next_retry_at = datetime('now', '-1 minutes') WHERE id=?",
+            (qid,)
+        )
+        conn.commit()
+        conn.close()
+        pending = txn.get_pending_sync()
+        assert any(p["id"] == result["id"] for p in pending)
+
+    def test_force_retry_clears_backoff(self, test_db):
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        qid = self._queue_id(result["id"])
+        txn.mark_sync_failed(qid, "401 unauthorized")
+        assert not any(p["id"] == result["id"] for p in txn.get_pending_sync())
+        assert txn.force_retry(result["id"]) is True
+        assert any(p["id"] == result["id"] for p in txn.get_pending_sync())
+
+    def test_force_retry_unknown_transaction_returns_false(self, test_db):
+        assert txn.force_retry(999999) is False
+
+    def test_force_retry_all_clears_every_backoff(self, test_db):
+        r1 = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        r2 = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        txn.mark_sync_failed(self._queue_id(r1["id"]), "err")
+        txn.mark_sync_failed(self._queue_id(r2["id"]), "err")
+        assert txn.force_retry_all() == 2
+        pending_ids = {p["id"] for p in txn.get_pending_sync()}
+        assert {r1["id"], r2["id"]} <= pending_ids
+
+    def test_get_pending_sync_count(self, test_db):
+        assert txn.get_pending_sync_count() == 0
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        assert txn.get_pending_sync_count() == 1
+        txn.mark_synced(result["id"])
+        assert txn.get_pending_sync_count() == 0
+
+    def test_get_pending_sync_count_includes_backed_off_rows(self, test_db):
+        """Even a row that's mid-backoff (not due for retry yet) still counts as
+        unsynced for the header's 'N pending' indicator."""
+        result = txn.create("cashier", None, _ITEMS, "CASH", 10.0, 10.0, 0.0)
+        txn.mark_sync_failed(self._queue_id(result["id"]), "err")
+        assert txn.get_pending_sync_count() == 1

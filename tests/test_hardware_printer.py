@@ -81,6 +81,70 @@ class TestPrintReceiptManual:
         printer.print_receipt({'reference': 'T-001', 'items': [], 'total': 0})  # must not raise
 
 
+class TestPrintReceiptEscposEnabled:
+    def setup_method(self):
+        printer._cached_settings = None
+
+    def teardown_method(self):
+        printer._cached_settings = None
+
+    def _escpos_ctx(self, mock_p):
+        return (
+            patch('hardware.printer._settings',
+                  return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
+                                'printer_host': '10.0.0.5', 'printer_port': '9100'}),
+            patch('hardware.printer._get_escpos_client', return_value=mock_p),
+        )
+
+    def test_calls_barcode_with_reference(self, test_db):
+        mock_p = MagicMock()
+        c1, c2 = self._escpos_ctx(mock_p)
+        with c1, c2:
+            printer.print_receipt({
+                'reference': 'POS-001-20260928-0001', 'items': [], 'total': 5.50,
+            })
+        mock_p.barcode.assert_called_once()
+        assert mock_p.barcode.call_args[0][0] == 'POS-001-20260928-0001'
+        assert mock_p.barcode.call_args[0][1] == 'CODE128'
+        mock_p.cut.assert_called_once()
+
+    def test_sale_receipt_does_not_print_refund_header(self, test_db):
+        mock_p = MagicMock()
+        c1, c2 = self._escpos_ctx(mock_p)
+        with c1, c2:
+            printer.print_receipt({
+                'reference': 'POS-001-20260928-0001',
+                'transaction_type': 'SALE', 'items': [], 'total': 5.50,
+            })
+        printed = "".join(call.args[0] for call in mock_p.text.call_args_list)
+        assert "REFUND" not in printed
+        assert "TOTAL: 5.50" in printed
+
+    def test_refund_receipt_prints_refund_header_and_original_reference(self, test_db):
+        mock_p = MagicMock()
+        c1, c2 = self._escpos_ctx(mock_p)
+        with c1, c2:
+            printer.print_receipt({
+                'reference': 'RFD-POS-001-20260928-0001',
+                'transaction_type': 'REFUND', 'refund_of_reference': 'POS-001-20260927-0002',
+                'items': [{'qty': -1, 'description': 'Cantaloupe Half', 'line_total': -5.50}],
+                'total': -5.50,
+            })
+        printed = "".join(call.args[0] for call in mock_p.text.call_args_list)
+        assert "REFUND" in printed
+        assert "POS-001-20260927-0002" in printed
+        assert "TOTAL REFUNDED: 5.50" in printed
+        mock_p.barcode.assert_called_once()
+        assert mock_p.barcode.call_args[0][0] == 'RFD-POS-001-20260928-0001'
+
+    def test_printer_failure_is_caught_not_raised(self, test_db):
+        with patch('hardware.printer._settings',
+                   return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
+                                 'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
+             patch('hardware.printer._get_escpos_client', side_effect=Exception('unreachable')):
+            printer.print_receipt({'reference': 'T-001', 'items': [], 'total': 0})  # must not raise
+
+
 class TestPrintHoldTicketManual:
     def setup_method(self):
         printer._cached_settings = None

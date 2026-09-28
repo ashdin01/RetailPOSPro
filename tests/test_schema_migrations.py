@@ -2,9 +2,9 @@
 Tests for database/schema.py version-gated migrations.
 
 A "v1 database" is one created before migrations were version-tracked —
-it has schema_version=1 and is missing the columns/settings added in v2, v3
-and v4. These tests verify that setup() detects the version and applies only
-the missing migrations, then updates schema_version to 4.
+it has schema_version=1 and is missing the columns/settings added in v2, v3,
+v4 and v5. These tests verify that setup() detects the version and applies
+only the missing migrations, then updates schema_version to 5.
 """
 import sqlite3
 import pytest
@@ -78,7 +78,7 @@ class TestNewDatabaseVersion:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 4
+        assert int(row['value']) == 6
 
     def test_new_db_has_group_name_column(self, test_db):
         from database.connection import get_connection
@@ -127,7 +127,7 @@ class TestMigrateFromV1:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 4
+        assert int(row['value']) == 6
 
     def test_adds_group_name_column(self, v1_db):
         from database.connection import get_connection
@@ -198,6 +198,206 @@ class TestMigrateFromV1:
         assert row is not None
 
 
+def _make_v4_db(tmp_path) -> str:
+    """Return path to a v4 database — has sync_queue, but without the
+    next_retry_at/last_attempt_at columns added in v5 — with one sale stuck
+    in the old permanent-give-up state (attempts >= 5, the old hard cutoff)."""
+    db_path = str(tmp_path / "v4.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO settings (key, value) VALUES ('schema_version', '4');
+
+        CREATE TABLE transactions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference       TEXT NOT NULL UNIQUE,
+            shift_id        INTEGER,
+            operator        TEXT NOT NULL,
+            sale_date       TEXT NOT NULL,
+            payment_method  TEXT NOT NULL,
+            subtotal        REAL NOT NULL DEFAULT 0,
+            gst_amount      REAL NOT NULL DEFAULT 0,
+            total           REAL NOT NULL DEFAULT 0,
+            tendered        REAL NOT NULL DEFAULT 0,
+            change_given    REAL NOT NULL DEFAULT 0,
+            item_count      INTEGER NOT NULL DEFAULT 0,
+            status          TEXT NOT NULL DEFAULT 'COMPLETED',
+            synced          INTEGER NOT NULL DEFAULT 0,
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- sync_queue WITHOUT next_retry_at / last_attempt_at (added in v5)
+        CREATE TABLE sync_queue (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id),
+            queued_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            attempts       INTEGER NOT NULL DEFAULT 0,
+            last_error     TEXT
+        );
+
+        INSERT INTO transactions
+            (reference, operator, sale_date, payment_method, total, synced)
+        VALUES ('POS-001-20260927-0001', 'admin', '2026-09-27', 'CASH', 455.05, 0);
+
+        -- Simulates a sale abandoned under the old attempts<5 cutoff.
+        INSERT INTO sync_queue (transaction_id, attempts, last_error)
+        VALUES (1, 7, '401 Unauthorized');
+    """)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+@pytest.fixture
+def v4_db(tmp_path, monkeypatch):
+    db_path = _make_v4_db(tmp_path)
+    monkeypatch.setattr(_conn_mod, "DATABASE_PATH", db_path)
+    yield db_path
+
+
+class TestMigrateFromV4:
+    def test_adds_backoff_columns(self, v4_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+        conn = get_connection()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_queue)").fetchall()}
+        conn.close()
+        assert {'next_retry_at', 'last_attempt_at'} <= cols
+
+    def test_previously_abandoned_sale_becomes_retry_eligible(self, v4_db):
+        """The core promise of this migration: a sale stuck under the old
+        hard 5-attempt cutoff must sync again automatically after upgrade,
+        with no manual DB intervention."""
+        from database.connection import get_connection
+        import models.transaction as txn
+
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+
+        pending = txn.get_pending_sync()
+        assert any(p['reference'] == 'POS-001-20260927-0001' for p in pending)
+
+    def test_attempts_and_last_error_preserved(self, v4_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT attempts, last_error FROM sync_queue WHERE transaction_id=1"
+        ).fetchone()
+        conn.close()
+        assert row['attempts'] == 7
+        assert row['last_error'] == '401 Unauthorized'
+
+
+def _make_v5_db(tmp_path) -> str:
+    """Return path to a v5 database — has transactions, but without the
+    transaction_type/refund_of_reference columns added in v6."""
+    db_path = str(tmp_path / "v5.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO settings (key, value) VALUES ('schema_version', '5');
+
+        -- transactions WITHOUT transaction_type / refund_of_reference (added in v6)
+        CREATE TABLE transactions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference       TEXT NOT NULL UNIQUE,
+            shift_id        INTEGER,
+            operator        TEXT NOT NULL,
+            sale_date       TEXT NOT NULL,
+            payment_method  TEXT NOT NULL,
+            subtotal        REAL NOT NULL DEFAULT 0,
+            gst_amount      REAL NOT NULL DEFAULT 0,
+            total           REAL NOT NULL DEFAULT 0,
+            tendered        REAL NOT NULL DEFAULT 0,
+            change_given    REAL NOT NULL DEFAULT 0,
+            item_count      INTEGER NOT NULL DEFAULT 0,
+            status          TEXT NOT NULL DEFAULT 'COMPLETED',
+            synced          INTEGER NOT NULL DEFAULT 0,
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE sync_queue (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id  INTEGER NOT NULL REFERENCES transactions(id),
+            queued_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            next_retry_at   DATETIME,
+            last_attempt_at DATETIME
+        );
+
+        INSERT INTO transactions
+            (reference, operator, sale_date, payment_method, total, synced)
+        VALUES ('POS-001-20260927-0002', 'admin', '2026-09-27', 'CASH', 5.50, 1);
+    """)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+@pytest.fixture
+def v5_db(tmp_path, monkeypatch):
+    db_path = _make_v5_db(tmp_path)
+    monkeypatch.setattr(_conn_mod, "DATABASE_PATH", db_path)
+    yield db_path
+
+
+class TestMigrateFromV5:
+    def test_adds_refund_columns(self, v5_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+        conn = get_connection()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+        conn.close()
+        assert {'transaction_type', 'refund_of_reference'} <= cols
+
+    def test_existing_rows_default_to_sale_type(self, v5_db):
+        from database.connection import get_connection
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT transaction_type, refund_of_reference FROM transactions "
+            "WHERE reference='POS-001-20260927-0002'"
+        ).fetchone()
+        conn.close()
+        assert row['transaction_type'] == 'SALE'
+        assert row['refund_of_reference'] is None
+
+    def test_new_transaction_helpers_work_after_migration(self, v5_db):
+        """The migration alone isn't the point — models.transaction's new
+        functions must actually work against a freshly-migrated DB."""
+        from database.connection import get_connection
+        import models.transaction as txn
+
+        conn = get_connection()
+        setup(conn)
+        conn.close()
+
+        sale = txn.get_by_reference('POS-001-20260927-0002')
+        assert sale is not None
+        refund = txn.create_refund(
+            "cashier", None, sale["reference"],
+            [{"barcode": "X", "description": "Test", "qty": 1.0,
+              "unit_price": 5.50, "tax_rate": 10.0, "line_total": 5.50}],
+        )
+        assert refund["transaction_type"] == "REFUND"
+        assert refund["total"] == -5.50
+
+
 class TestMigrationIdempotency:
     def test_setup_twice_does_not_fail(self, test_db):
         from database.connection import get_connection
@@ -207,7 +407,7 @@ class TestMigrationIdempotency:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 4
+        assert int(row['value']) == 6
 
     def test_v1_migration_twice_does_not_fail(self, v1_db):
         from database.connection import get_connection
@@ -220,4 +420,4 @@ class TestMigrationIdempotency:
             "SELECT value FROM settings WHERE key='schema_version'"
         ).fetchone()
         conn.close()
-        assert int(row['value']) == 4
+        assert int(row['value']) == 6

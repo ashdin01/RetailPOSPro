@@ -159,6 +159,28 @@ class TestApiKeyCache:
         sent_headers = mock_post.call_args[1].get('headers', {})
         assert sent_headers.get('X-API-Key') == 'secret'
 
+    def test_post_refund_sends_api_key_and_posts_to_refund_endpoint(self, test_db):
+        with patch('utils.credentials.get_credential', return_value='secret'), \
+             patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {'ok': True}
+            bop.post_refund({'reference': 'RFD-001', 'original_reference': 'T-001'})
+        sent_headers = mock_post.call_args[1].get('headers', {})
+        assert sent_headers.get('X-API-Key') == 'secret'
+        assert mock_post.call_args[0][0].endswith('/api/v1/pos/refund')
+
+    def test_post_refund_returns_none_on_non_200(self, test_db):
+        with patch('utils.credentials.get_credential', return_value='secret'), \
+             patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 409
+            mock_post.return_value.text = 'over-refund'
+            assert bop.post_refund({'reference': 'RFD-001'}) is None
+
+    def test_post_refund_returns_none_on_exception(self, test_db):
+        with patch('utils.credentials.get_credential', return_value='secret'), \
+             patch('requests.post', side_effect=Exception('offline')):
+            assert bop.post_refund({'reference': 'RFD-001'}) is None
+
 
 class TestSyncProductCachePagination:
     def test_paginates_across_multiple_pages(self, test_db):

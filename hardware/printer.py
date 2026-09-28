@@ -66,23 +66,47 @@ def _get_escpos_client():
 
 def print_receipt(txn: dict):
     """
-    Print a completed-sale receipt.
+    Print a completed-sale or refund receipt.
+
+    Every receipt carries a scannable Code128 barcode of its own reference
+    (same technique as print_hold_ticket below) — scanning it back in at the
+    POS scan bar reopens this exact transaction (views/pos_screen.py's
+    scan-to-reopen handling).
 
     Never raises — logs and returns on any failure so a printer fault can't
-    block the till from finishing a sale.
+    block the till from finishing a sale or refund.
     """
     if not is_enabled() or get_protocol() != 'escpos':
         logging.info("[printer] Receipt for %s — printing disabled/manual", txn.get('reference'))
         return
+    is_refund = txn.get('transaction_type') == 'REFUND'
     try:
         p = _get_escpos_client()
         p.set(align='center', bold=True)
-        p.text(f"{txn.get('reference', '')}\n")
+        if is_refund:
+            p.text("REFUND\n")
+            p.set(bold=False)
+            p.text(f"{txn.get('reference', '')}\n")
+            if txn.get('refund_of_reference'):
+                p.text(f"Original: {txn['refund_of_reference']}\n")
+        else:
+            p.text(f"{txn.get('reference', '')}\n")
+            p.set(bold=False)
         p.set(align='left', bold=False)
         for item in txn.get('items', []):
-            line_total = item.get('line_total', round(item['qty'] * item['unit_price'], 2))
+            line_total = item.get('line_total')
+            if line_total is None:
+                line_total = round(item['qty'] * item['unit_price'], 2)
             p.text(f"{item['qty']:g} x {item['description']}  {line_total:.2f}\n")
-        p.text(f"\nTOTAL: {txn.get('total', 0):.2f}\n")
+        total = txn.get('total', 0)
+        if is_refund:
+            p.text(f"\nTOTAL REFUNDED: {abs(total):.2f}\n\n")
+        else:
+            p.text(f"\nTOTAL: {total:.2f}\n\n")
+        # Signature verified against python-escpos 3.1 (pinned via requirements.txt):
+        # barcode(code, bc, height=64, width=3, pos='BELOW', font='A', align_ct=True, ...).
+        p.set(align='center')
+        p.barcode(txn.get('reference', ''), 'CODE128', height=64, width=2, pos='BELOW', align_ct=True)
         p.cut()
         p.close()
     except Exception as e:
