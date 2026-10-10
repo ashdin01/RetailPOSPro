@@ -28,6 +28,7 @@ from PyQt6.QtCore import Qt
 from config.settings import TOUCH_BTN_HEIGHT
 import models.transaction as txn_model
 import hardware.printer as printer
+import hardware.drawer as drawer
 from utils.format import currency
 
 _DARK_BG  = "#1a2332"
@@ -270,6 +271,7 @@ class RefundDialog(QDialog):
             return
 
         printer.print_receipt(refund)
+        drawer.open_drawer()   # refunds are always cash — staff need to hand it back
         QMessageBox.information(
             self, "Refund Recorded",
             f"{refund['reference']} — {currency(abs(refund['total']))} refunded."

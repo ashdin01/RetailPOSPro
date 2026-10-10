@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 from PyQt6.QtWidgets import QApplication, QMessageBox, QDialog
 
 import hardware.printer as printer
+import hardware.drawer as drawer
 import models.transaction as txn_model
 from views.refund_dialog import RefundDialog
 
@@ -181,3 +182,41 @@ class TestRefundDialogConfirm:
             dlg._confirm()
         mock_accept.assert_not_called()
         assert len(warned) == 1
+
+    def test_confirm_opens_cash_drawer(self, qtbot, sale, monkeypatch):
+        """Refunds are always cash (see models.transaction.create_refund) —
+        staff need the drawer open to hand cash back to the customer."""
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        monkeypatch.setattr(QMessageBox, 'question',
+                             lambda *a, **k: QMessageBox.StandardButton.Yes)
+        monkeypatch.setattr(QMessageBox, 'information', lambda *a, **k: None)
+        opened = []
+        monkeypatch.setattr(drawer, 'open_drawer', lambda: opened.append(True))
+        dlg._confirm()
+        assert opened == [True]
+
+    def test_declined_confirm_does_not_open_drawer(self, qtbot, sale, monkeypatch):
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        monkeypatch.setattr(QMessageBox, 'question',
+                             lambda *a, **k: QMessageBox.StandardButton.No)
+        opened = []
+        monkeypatch.setattr(drawer, 'open_drawer', lambda: opened.append(True))
+        dlg._confirm()
+        assert opened == []
+
+    def test_failed_refund_does_not_open_drawer(self, qtbot, sale, monkeypatch):
+        dlg = RefundDialog(sale, operator='alice', shift_id=None)
+        qtbot.addWidget(dlg)
+        monkeypatch.setattr(QMessageBox, 'question',
+                             lambda *a, **k: QMessageBox.StandardButton.Yes)
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *a, **k: None)
+        monkeypatch.setattr(
+            txn_model, 'create_refund',
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db boom')),
+        )
+        opened = []
+        monkeypatch.setattr(drawer, 'open_drawer', lambda: opened.append(True))
+        dlg._confirm()
+        assert opened == []

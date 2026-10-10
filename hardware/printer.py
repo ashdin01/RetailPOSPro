@@ -58,7 +58,7 @@ def get_protocol() -> str:
     return _settings().get('printer_protocol', 'manual')
 
 
-def _get_escpos_client():
+def get_escpos_client():
     from escpos.printer import Network
     s = _settings()
     return Network(s.get('printer_host', ''), port=int(s.get('printer_port', '9100') or '9100'))
@@ -81,7 +81,7 @@ def print_receipt(txn: dict):
         return
     is_refund = txn.get('transaction_type') == 'REFUND'
     try:
-        p = _get_escpos_client()
+        p = get_escpos_client()
         p.set(align='center', bold=True)
         if is_refund:
             p.text("REFUND\n")
@@ -126,7 +126,7 @@ def print_hold_ticket(reference: str, items: list, total: float):
         logging.info("[printer] Hold ticket %s — printing disabled/manual", reference)
         return
     try:
-        p = _get_escpos_client()
+        p = get_escpos_client()
         p.set(align='center', bold=True)
         p.text("SALE ON HOLD\n")
         p.set(bold=False)
@@ -151,7 +151,7 @@ def test_connection() -> tuple:
         return True, "Manual mode — no connection test needed."
     s = _settings()
     try:
-        p = _get_escpos_client()
+        p = get_escpos_client()
         p.text("Test print - connection OK\n")
         p.cut()
         p.close()

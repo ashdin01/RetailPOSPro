@@ -66,14 +66,14 @@ class TestPrintReceiptManual:
         printer._cached_settings = None
 
     def test_manual_protocol_does_not_attempt_connection(self, test_db):
-        with patch('hardware.printer._get_escpos_client') as mock_client:
+        with patch('hardware.printer.get_escpos_client') as mock_client:
             printer.print_receipt({'reference': 'T-001', 'items': [], 'total': 0})
         mock_client.assert_not_called()
 
     def test_disabled_does_not_attempt_connection_even_if_protocol_escpos(self, test_db):
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '0', 'printer_protocol': 'escpos'}), \
-             patch('hardware.printer._get_escpos_client') as mock_client:
+             patch('hardware.printer.get_escpos_client') as mock_client:
             printer.print_receipt({'reference': 'T-001', 'items': [], 'total': 0})
         mock_client.assert_not_called()
 
@@ -93,7 +93,7 @@ class TestPrintReceiptEscposEnabled:
             patch('hardware.printer._settings',
                   return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                 'printer_host': '10.0.0.5', 'printer_port': '9100'}),
-            patch('hardware.printer._get_escpos_client', return_value=mock_p),
+            patch('hardware.printer.get_escpos_client', return_value=mock_p),
         )
 
     def test_calls_barcode_with_reference(self, test_db):
@@ -141,7 +141,7 @@ class TestPrintReceiptEscposEnabled:
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                  'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
-             patch('hardware.printer._get_escpos_client', side_effect=Exception('unreachable')):
+             patch('hardware.printer.get_escpos_client', side_effect=Exception('unreachable')):
             printer.print_receipt({'reference': 'T-001', 'items': [], 'total': 0})  # must not raise
 
 
@@ -153,7 +153,7 @@ class TestPrintHoldTicketManual:
         printer._cached_settings = None
 
     def test_manual_protocol_does_not_attempt_connection(self, test_db):
-        with patch('hardware.printer._get_escpos_client') as mock_client:
+        with patch('hardware.printer.get_escpos_client') as mock_client:
             printer.print_hold_ticket('HLD-00001', [], 0)
         mock_client.assert_not_called()
 
@@ -173,7 +173,7 @@ class TestPrintHoldTicketEscposEnabled:
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                  'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
-             patch('hardware.printer._get_escpos_client', return_value=mock_p):
+             patch('hardware.printer.get_escpos_client', return_value=mock_p):
             printer.print_hold_ticket('HLD-00001', [{'qty': 1, 'description': 'Milk'}], 5.0)
         mock_p.barcode.assert_called_once()
         assert mock_p.barcode.call_args[0][0] == 'HLD-00001'
@@ -184,7 +184,7 @@ class TestPrintHoldTicketEscposEnabled:
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                  'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
-             patch('hardware.printer._get_escpos_client', side_effect=Exception('unreachable')):
+             patch('hardware.printer.get_escpos_client', side_effect=Exception('unreachable')):
             printer.print_hold_ticket('HLD-00001', [], 0)  # must not raise
 
 
@@ -196,7 +196,7 @@ class TestConnectionTest:
         printer._cached_settings = None
 
     def test_manual_protocol_returns_true_without_connecting(self, test_db):
-        with patch('hardware.printer._get_escpos_client') as mock_client:
+        with patch('hardware.printer.get_escpos_client') as mock_client:
             ok, msg = printer.test_connection()
         assert ok is True
         mock_client.assert_not_called()
@@ -206,7 +206,7 @@ class TestConnectionTest:
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                  'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
-             patch('hardware.printer._get_escpos_client', return_value=mock_p):
+             patch('hardware.printer.get_escpos_client', return_value=mock_p):
             ok, msg = printer.test_connection()
         assert ok is True
 
@@ -214,7 +214,7 @@ class TestConnectionTest:
         with patch('hardware.printer._settings',
                    return_value={'printer_enabled': '1', 'printer_protocol': 'escpos',
                                  'printer_host': '10.0.0.5', 'printer_port': '9100'}), \
-             patch('hardware.printer._get_escpos_client', side_effect=Exception('refused')):
+             patch('hardware.printer.get_escpos_client', side_effect=Exception('refused')):
             ok, msg = printer.test_connection()
         assert ok is False
         assert 'refused' in msg
