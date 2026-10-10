@@ -44,7 +44,7 @@ import hardware.printer as printer
 import hardware.drawer as drawer
 import hardware.scale as scale
 import hardware.eftpos as eftpos
-from utils.barcode import decode_weight_barcode
+from utils.barcode import decode_scale_label
 
 _DARK_BG   = "#1a2332"
 _CARD_BG   = "#1e2a38"
@@ -1367,20 +1367,20 @@ class POSScreen(QMainWindow):
             self._reopen_by_scan(text.upper())
             return
 
-        # ── Random-weight barcode (EAN-13 starting with 2) ────────────
-        weight_info = decode_weight_barcode(text)
-        if weight_info:
-            plu        = weight_info['plu']
-            weight_kg  = weight_info['weight_kg']
-            product = product_model.get_by_plu(plu)
+        # ── Scale-label barcode (weigh-and-label machine, layout from settings) ──
+        label = decode_scale_label(text)
+        if label:
+            product = product_model.get_by_plu(label['plu'])
             if product is None:
                 product = product_model.get_by_barcode(text)
             if product:
-                self._clear_pending_state()
-                self._add_to_basket(product, weight_kg)
-                self._scan_input.setFocus()
-                return
-            # barcode not in cache — fall through to normal not-found handling
+                qty = self._scale_label_qty(product, label)
+                if qty:
+                    self._clear_pending_state()
+                    self._add_to_basket(product, qty)
+                    self._scan_input.setFocus()
+                    return
+            # not in cache / unpriceable — fall through to normal not-found handling
 
         # ── Normal PLU / barcode lookup ───────────────────────────────
         product = None
@@ -1397,6 +1397,18 @@ class POSScreen(QMainWindow):
         self._clear_pending_state()
         self._add_to_basket(product, qty)
         self._scan_input.setFocus()
+
+    @staticmethod
+    def _scale_label_qty(product: dict, label: dict) -> float:
+        """Quantity (kg) a scale label represents. A weight label carries it
+        directly; a price label is converted at the product's sell price, so
+        the line total comes back to the printed price. 0 if it can't be priced."""
+        if label['weight_kg'] is not None:
+            return label['weight_kg']
+        sell = float(product.get('sell_price') or 0)
+        if sell <= 0:
+            return 0.0
+        return round(label['price'] / sell, 3)
 
     def _add_to_basket(self, product: dict, qty: float):
         barcode = product['barcode']

@@ -84,3 +84,60 @@ class TestDecodeWeightBarcode:
         result = decode_weight_barcode(barcode)
         assert result is not None
         assert result["weight_kg"] == 0.25
+
+
+# ── Configurable scale-label decoding ────────────────────────────────────────
+from utils.barcode import decode_scale_label, ean13_check_ok
+
+
+def _ean13(body12: str) -> str:
+    total = sum(int(d) * (3 if i % 2 else 1) for i, d in enumerate(body12))
+    return body12 + str((10 - total % 10) % 10)
+
+
+class TestDecodeScaleLabel:
+    def test_default_layout_matches_legacy_weight_decoder(self):
+        code = _ean13("210014000625")  # 2 D=1 PLU=00140 W=00625
+        assert decode_scale_label(code, {}) == {'plu': '140', 'weight_kg': 0.625, 'price': None}
+
+    def test_price_label(self):
+        cfg = {'scale_label_plu_start': '1', 'scale_label_plu_len': '6',
+               'scale_label_value_start': '7', 'scale_label_value_len': '5',
+               'scale_label_value_type': 'price'}
+        code = _ean13("200014000845")  # PLU 000140, $8.45
+        assert decode_scale_label(code, cfg) == {'plu': '140', 'weight_kg': None, 'price': 8.45}
+
+    def test_multiple_prefixes(self):
+        cfg = {'scale_label_prefixes': '20,21'}
+        assert decode_scale_label(_ean13("210014000625"), cfg) is not None
+        assert decode_scale_label(_ean13("220014000625"), cfg) is None
+
+    def test_upca_style_02_prefix_label_decodes_by_default(self):
+        # UPC-A 2PPPPPVVVVVC arrives from the scanner as 13 digits with a leading 0
+        from_ = {}
+        code = "0200140006953"
+        r = decode_scale_label(code, from_)
+        assert r == {'plu': '140', 'weight_kg': 0.695, 'price': None}
+
+    def test_normal_barcode_not_decoded(self):
+        assert decode_scale_label("9300675009657", {}) is None
+
+    def test_disabled(self):
+        assert decode_scale_label(_ean13("210014000625"), {'scale_label_enabled': '0'}) is None
+
+    def test_zero_value_rejected(self):
+        assert decode_scale_label(_ean13("210014000000"), {}) is None
+
+    def test_check_digit_enforced_when_enabled(self):
+        good = _ean13("210014000625")
+        bad = good[:-1] + str((int(good[-1]) + 1) % 10)
+        assert decode_scale_label(bad, {}) is not None
+        assert decode_scale_label(bad, {'scale_label_check': '1'}) is None
+        assert decode_scale_label(good, {'scale_label_check': '1'}) is not None
+
+    def test_out_of_range_config_rejected(self):
+        assert decode_scale_label(_ean13("210014000625"), {'scale_label_value_start': '9'}) is None
+        assert decode_scale_label(_ean13("210014000625"), {'scale_label_plu_len': 'x'}) is None
+
+    def test_ean13_check_ok(self):
+        assert ean13_check_ok(_ean13("400638133393"))

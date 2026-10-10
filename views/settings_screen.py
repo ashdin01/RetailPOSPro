@@ -13,6 +13,9 @@ from PyQt6.QtCore import Qt, QEvent, QObject
 from database.connection import get_connection
 from config.settings import TOUCH_BTN_HEIGHT
 import api.backoffice_client as bop
+from utils.barcode import (
+    decode_scale_label, SCALE_LABEL_DEFAULTS, SCALE_LABEL_PRESETS,
+)
 
 _TERMINAL_FIELDS = [
     ("store_name",          "Store Name",              "e.g. My Supermarket"),
@@ -321,10 +324,119 @@ class ScaleSettingsDialog(_BaseSettingsDialog):
         form.addRow("", test_row)
 
         lay.addWidget(box)
+
+        # ── Scale-label barcodes (weigh-and-label machine) ────────────────
+        lbl_title = QLabel("Scale Label Barcodes")
+        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        lay.addWidget(lbl_title)
+        lbl_note = QLabel(
+            "EAN-13 labels printed by a weigh-and-label machine, with the PLU and "
+            "weight or price embedded. Digit positions count from 0 at the first digit."
+        )
+        lbl_note.setWordWrap(True)
+        lbl_note.setStyleSheet("color: #8b949e; font-size: 13px;")
+        lay.addWidget(lbl_note)
+
+        lbox = QGroupBox()
+        lform = QFormLayout(lbox)
+        lform.setSpacing(12)
+
+        self._label_enabled_chk = QCheckBox("Recognise scale-label barcodes")
+        self._label_enabled_chk.setStyleSheet("font-size: 14px;")
+        lform.addRow("", self._label_enabled_chk)
+
+        self._label_preset_combo = QComboBox()
+        self._label_preset_combo.addItem("Custom", None)
+        for name in SCALE_LABEL_PRESETS:
+            self._label_preset_combo.addItem(name, name)
+        self._label_preset_combo.setFixedHeight(TOUCH_BTN_HEIGHT)
+        self._label_preset_combo.setStyleSheet(_COMBO_STYLE)
+        self._label_preset_combo.currentIndexChanged.connect(self._on_label_preset)
+        lform.addRow("Layout:", self._label_preset_combo)
+
+        self._label_type_combo = QComboBox()
+        self._label_type_combo.addItem("Weight (grams)", 'weight')
+        self._label_type_combo.addItem("Price (cents)", 'price')
+        self._label_type_combo.setFixedHeight(TOUCH_BTN_HEIGHT)
+        self._label_type_combo.setStyleSheet(_COMBO_STYLE)
+        lform.addRow("Embedded value:", self._label_type_combo)
+
+        self._label_edits = {}
+        for key, label, ph in (
+            ('scale_label_prefixes',    "Starts with:",     "e.g. 2 or 20,21"),
+            ('scale_label_plu_start',   "PLU starts at:",   "0-12"),
+            ('scale_label_plu_len',     "PLU digits:",      "e.g. 5"),
+            ('scale_label_value_start', "Value starts at:", "0-12"),
+            ('scale_label_value_len',   "Value digits:",    "e.g. 5"),
+        ):
+            edit = QLineEdit()
+            edit.setPlaceholderText(ph)
+            edit.setFixedHeight(TOUCH_BTN_HEIGHT)
+            edit.setStyleSheet(_EDIT_STYLE)
+            edit.textEdited.connect(self._on_label_field_edited)
+            self._label_edits[key] = edit
+            self._fields[key] = edit
+            lform.addRow(label, edit)
+
+        self._label_check_chk = QCheckBox("Reject labels with a bad EAN-13 check digit")
+        self._label_check_chk.setStyleSheet("font-size: 14px;")
+        lform.addRow("", self._label_check_chk)
+
+        self._label_test_edit = QLineEdit()
+        self._label_test_edit.setPlaceholderText("Scan or type a label barcode to test")
+        self._label_test_edit.setFixedHeight(TOUCH_BTN_HEIGHT)
+        self._label_test_edit.setStyleSheet(_EDIT_STYLE)
+        self._label_test_edit.textChanged.connect(self._test_label)
+        lform.addRow("Test:", self._label_test_edit)
+        self._label_test_result = QLabel("")
+        self._label_test_result.setStyleSheet("font-size: 14px;")
+        lform.addRow("", self._label_test_result)
+
+        lay.addWidget(lbox)
         lay.addStretch()
         scroll.setWidget(content)
         outer.addWidget(scroll, stretch=1)
         outer.addWidget(_bottom_bar(self, self._save))
+
+    # ── scale-label helpers ───────────────────────────────────────────────
+    def _label_cfg(self) -> dict:
+        cfg = {k: e.text().strip() for k, e in self._label_edits.items()}
+        cfg['scale_label_enabled'] = '1' if self._label_enabled_chk.isChecked() else '0'
+        cfg['scale_label_value_type'] = self._label_type_combo.currentData()
+        cfg['scale_label_check'] = '1' if self._label_check_chk.isChecked() else '0'
+        return cfg
+
+    def _on_label_preset(self, _idx):
+        name = self._label_preset_combo.currentData()
+        if name is None:
+            return
+        prefixes, ps, pl, vs, vl = SCALE_LABEL_PRESETS[name]
+        for key, val in (('scale_label_prefixes', prefixes),
+                         ('scale_label_plu_start', ps), ('scale_label_plu_len', pl),
+                         ('scale_label_value_start', vs), ('scale_label_value_len', vl)):
+            self._label_edits[key].setText(str(val))
+        self._test_label()
+
+    def _on_label_field_edited(self, _text):
+        self._label_preset_combo.blockSignals(True)
+        self._label_preset_combo.setCurrentIndex(0)
+        self._label_preset_combo.blockSignals(False)
+        self._test_label()
+
+    def _test_label(self, *_):
+        code = self._label_test_edit.text().strip()
+        if not code:
+            self._label_test_result.setText("")
+            return
+        cfg = self._label_cfg()
+        cfg['scale_label_enabled'] = '1'
+        r = decode_scale_label(code, cfg)
+        if r is None:
+            self._label_test_result.setText("Not recognised as a scale label")
+        elif r['price'] is not None:
+            self._label_test_result.setText(f"PLU {r['plu']}  ·  price ${r['price']:.2f}")
+        else:
+            self._label_test_result.setText(f"PLU {r['plu']}  ·  weight {r['weight_kg']:.3f} kg")
 
     def _on_enabled_changed(self, state):
         enabled = state == Qt.CheckState.Checked.value
@@ -350,13 +462,33 @@ class ScaleSettingsDialog(_BaseSettingsDialog):
                 self._proto_combo.setCurrentIndex(i)
                 break
 
+        lv = {**SCALE_LABEL_DEFAULTS, **{k: v for k, v in vals.items()
+                                         if k.startswith('scale_label_') and v != ''}}
+        self._label_enabled_chk.setChecked(lv['scale_label_enabled'] == '1')
+        self._label_check_chk.setChecked(lv['scale_label_check'] == '1')
+        for key, edit in self._label_edits.items():
+            edit.setText(lv[key])
+        ti = self._label_type_combo.findData(lv['scale_label_value_type'])
+        self._label_type_combo.setCurrentIndex(max(ti, 0))
+        self._label_preset_combo.blockSignals(True)
+        self._label_preset_combo.setCurrentIndex(0)
+        current = (lv['scale_label_prefixes'], lv['scale_label_plu_start'],
+                   lv['scale_label_plu_len'], lv['scale_label_value_start'],
+                   lv['scale_label_value_len'])
+        for name, (pf, ps, pl, vs, vl) in SCALE_LABEL_PRESETS.items():
+            if current == (pf, str(ps), str(pl), str(vs), str(vl)):
+                self._label_preset_combo.setCurrentIndex(
+                    self._label_preset_combo.findData(name))
+                break
+        self._label_preset_combo.blockSignals(False)
+
     def _save(self):
         _save_settings([
             ('scale_port',     self._port_edit.text().strip()),
             ('scale_baud',     self._baud_combo.currentText()),
             ('scale_protocol', self._proto_combo.currentData()),
             ('scale_enabled',  '1' if self._scale_enabled_chk.isChecked() else '0'),
-        ])
+        ] + list(self._label_cfg().items()))
         QMessageBox.information(self, "Saved", "Scale settings saved.")
 
     def _test_scale(self):
